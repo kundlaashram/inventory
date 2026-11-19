@@ -6,10 +6,11 @@ import SellBill from '@/models/SellBill'
 import Expense from '@/models/Expense'
 import Company from '@/models/Company'
 import mongoose from 'mongoose'
+import { countedIn, loadRevenueExclusion } from '@/lib/revenue-exclusion'
 
 export const dynamic = 'force-dynamic'
 
-type Period = 'today' | 'week' | 'month' | 'year' | 'custom'
+type Period = 'today' | 'yesterday' | 'week' | 'month' | 'year' | 'custom'
 
 function startOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0)
@@ -49,6 +50,10 @@ function getDashboardRanges(
   } else if (period === 'today') {
     currentStart = startOfDay(now)
     currentEnd = endOfDay(now)
+  } else if (period === 'yesterday') {
+    const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+    currentStart = startOfDay(yesterday)
+    currentEnd = endOfDay(yesterday)
   } else if (period === 'week') {
     const day = now.getDay()
     const diff = now.getDate() - day + (day === 0 ? -6 : 1) // Monday start
@@ -69,7 +74,8 @@ function getDashboardRanges(
   let previousStart: Date
   let previousEnd: Date
 
-  if (period === 'today') {
+  if (period === 'today' || period === 'yesterday') {
+    // The day before the selected day
     const yesterday = new Date(currentStart.getTime() - 24 * 60 * 60 * 1000)
     previousStart = startOfDay(yesterday)
     previousEnd = endOfDay(yesterday)
@@ -97,7 +103,7 @@ function getDashboardRanges(
   const rangeDays = rangeMs / (24 * 60 * 60 * 1000) + 1
 
   let chartFormat: string
-  if (period === 'today' || rangeDays <= 1) {
+  if (period === 'today' || period === 'yesterday' || rangeDays <= 1) {
     chartFormat = '%H:00'
   } else if (rangeDays <= 31) {
     chartFormat = '%Y-%m-%d'
@@ -127,7 +133,7 @@ export async function GET(req: NextRequest) {
 
     const { searchParams } = new URL(req.url)
     const periodParam = (searchParams.get('period') ?? 'month') as Period
-    const period: Period = ['today', 'week', 'month', 'year', 'custom'].includes(periodParam)
+    const period: Period = ['today', 'yesterday', 'week', 'month', 'year', 'custom'].includes(periodParam)
       ? periodParam
       : 'month'
     const startDate = searchParams.get('startDate')?.trim()
@@ -139,6 +145,9 @@ export async function GET(req: NextRequest) {
     await connectDB()
     // Ensure Company model is registered for any populate/aggregation that relies on it
     void Company
+    // Companies flagged "Exclude from revenue": out of Revenue / Cost, profit still counts
+    const exclusion = await loadRevenueExclusion(Company, searchParams)
+    const excludedIds = exclusion.ids
 
     const [
       summaryResult,
@@ -187,12 +196,14 @@ export async function GET(req: NextRequest) {
             },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
             _id: null,
-            revenue: { $sum: '$adjustedRevenue' },
-            cost: { $sum: '$itemCost' },
-            grossProfit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            grossProfit: { $sum: '$adjustedProfit' },
+            ctnSold: { $sum: '$ctnSold' },
           },
         },
       ]),
@@ -236,12 +247,13 @@ export async function GET(req: NextRequest) {
             },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
             _id: '$period',
-            revenue: { $sum: '$adjustedRevenue' },
-            cost: { $sum: '$itemCost' },
-            grossProfit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            grossProfit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { _id: 1 } },
@@ -286,6 +298,15 @@ export async function GET(req: NextRequest) {
         { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
         {
           $addFields: {
+            itemCost: {
+              $reduce: {
+                input: { $ifNull: ['$fifoBreakdown', []] },
+                initialValue: 0,
+                in: {
+                  $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }],
+                },
+              },
+            },
             adjustedRevenue: {
               $cond: [
                 { $gt: ['$bill.totalAmount', 0] },
@@ -300,12 +321,28 @@ export async function GET(req: NextRequest) {
             },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
-            _id: '$bill.company',
-            name: { $first: '$companyDoc.companyName' },
+            // Normalize missing vs explicit-null so bills predating the
+            // bankAccount field don't split into a separate group (dup rows).
+            _id: {
+              company: { $ifNull: ['$bill.company', null] },
+              bankAccount: { $ifNull: ['$bill.bankAccount', null] },
+            },
+            name: {
+              $first: {
+                $cond: [
+                  '$bill.company',
+                  '$companyDoc.companyName',
+                  { $ifNull: ['$bill.companyName', '—'] },
+                ],
+              },
+            },
+            isCashbook: { $first: { $ifNull: ['$bill.isCashbook', false] } },
+            isBankSale: { $first: { $ifNull: ['$bill.isBankSale', false] } },
             revenue: { $sum: '$adjustedRevenue' },
-            profit: { $sum: '$totalProfit' },
+            profit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { revenue: -1 } },
@@ -356,12 +393,14 @@ export async function GET(req: NextRequest) {
             },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
             _id: null,
-            revenue: { $sum: '$adjustedRevenue' },
-            cost: { $sum: '$itemCost' },
-            grossProfit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            grossProfit: { $sum: '$adjustedProfit' },
+            ctnSold: { $sum: '$ctnSold' },
           },
         },
       ]),
@@ -376,11 +415,13 @@ export async function GET(req: NextRequest) {
       revenue: 0,
       cost: 0,
       grossProfit: 0,
+      ctnSold: 0,
     }
     const totalExpensesCurrent = expensesSum[0]?.total ?? 0
     const revenueCurrent = summaryCurrent.revenue ?? 0
     const costCurrent = summaryCurrent.cost ?? 0
     const grossProfitCurrent = summaryCurrent.grossProfit ?? 0
+    const ctnSoldCurrent = summaryCurrent.ctnSold ?? 0
     const netProfitCurrent = grossProfitCurrent - totalExpensesCurrent
     const margin =
       revenueCurrent > 0 ? (netProfitCurrent / revenueCurrent) * 100 : 0
@@ -389,11 +430,13 @@ export async function GET(req: NextRequest) {
       revenue: 0,
       cost: 0,
       grossProfit: 0,
+      ctnSold: 0,
     }
     const totalExpensesPrev = prevExpensesSum[0]?.total ?? 0
     const revenuePrev = summaryPrev.revenue ?? 0
     const costPrev = summaryPrev.cost ?? 0
     const grossProfitPrev = summaryPrev.grossProfit ?? 0
+    const ctnSoldPrev = summaryPrev.ctnSold ?? 0
     const netProfitPrev = grossProfitPrev - totalExpensesPrev
 
     const expenseByPeriodMap = Object.fromEntries(
@@ -423,31 +466,36 @@ export async function GET(req: NextRequest) {
     })
 
     const topCompanies = (topCompaniesAgg as {
-      _id: mongoose.Types.ObjectId
+      _id: { company: mongoose.Types.ObjectId; bankAccount: mongoose.Types.ObjectId }
       name?: string
+      isCashbook?: boolean
+      isBankSale?: boolean
       revenue: number
       profit: number
-    }[]).map((r) => ({
-      name: r.name ?? '—',
-      revenue: r.revenue ?? 0,
-      profit: r.profit ?? 0,
-    }))
+    }[]).map((r) => {
+      const hasCompany = r._id?.company != null
+      const isCashbook = !hasCompany && !!r.isCashbook
+      const isBankSale = !hasCompany && !!r.isBankSale
+      const name = isCashbook ? '💵 Cashbook' : isBankSale ? (r.name ?? 'Bank Account') : (r.name ?? '—')
+      return { name, revenue: r.revenue ?? 0, profit: r.profit ?? 0 }
+    })
 
     const recentBills = (recentBillsRaw as {
       _id: mongoose.Types.ObjectId
       billNumber: number
       billDate: Date
-      company: { companyName?: string } | mongoose.Types.ObjectId
+      company: { companyName?: string } | mongoose.Types.ObjectId | null
+      isCashbook?: boolean
+      isBankSale?: boolean
+      companyName?: string
       totalAmount: number
-    }[]).map((b) => ({
-      id: String(b._id),
-      billNumber: b.billNumber,
-      date: b.billDate,
-      company:
-        (b.company as { companyName?: string })?.companyName ??
-        '—',
-      amount: b.totalAmount ?? 0,
-    }))
+    }[]).map((b) => {
+      let company: string
+      if (b.isCashbook) company = 'Cashbook'
+      else if (b.isBankSale) company = b.companyName ?? 'Bank Account'
+      else company = (b.company as { companyName?: string })?.companyName ?? '—'
+      return { id: String(b._id), billNumber: b.billNumber, date: b.billDate, company, amount: b.totalAmount ?? 0 }
+    })
 
     return NextResponse.json({
       success: true,
@@ -459,20 +507,20 @@ export async function GET(req: NextRequest) {
           expenses: totalExpensesCurrent,
           netProfit: netProfitCurrent,
           margin,
+          ctnSold: ctnSoldCurrent,
         },
         trends: {
           revenue: calcTrend(revenueCurrent, revenuePrev),
           cost: calcTrend(costCurrent, costPrev),
           grossProfit: calcTrend(grossProfitCurrent, grossProfitPrev),
-          expenses: calcTrend(
-            totalExpensesCurrent,
-            totalExpensesPrev
-          ),
+          expenses: calcTrend(totalExpensesCurrent, totalExpensesPrev),
           netProfit: calcTrend(netProfitCurrent, netProfitPrev),
+          ctnSold: calcTrend(ctnSoldCurrent, ctnSoldPrev),
         },
         chartData,
         topCompanies,
         recentBills,
+        revenueExclusion: { companies: exclusion.companies, included: exclusion.included },
       },
     })
   } catch (error) {

@@ -49,6 +49,7 @@ export function IndiaBuyingEntryTable({
   const [loading, setLoading] = useState(true)
   const [entries, setEntries] = useState<IndiaBuyingEntryRow[]>([])
   const [pagination, setPagination] = useState({ page: 1, pages: 1, total: 0 })
+  const [currentPage, setCurrentPage] = useState(1)
   const [expandedEntryId, setExpandedEntryId] = useState<string | null>(null)
   const [paymentsByEntry, setPaymentsByEntry] = useState<
     Record<string, { _id: string; amount: number; paymentDate: string; paymentSource?: string; bankAccountName?: string; companyName?: string; notes?: string }[]>
@@ -56,14 +57,16 @@ export function IndiaBuyingEntryTable({
   const [paymentsLoading, setPaymentsLoading] = useState<string | null>(null)
 
   function stockBadge(entry: IndiaBuyingEntryRow) {
-    const soldCtn = entry.totalCtn - (entry.availableCtn ?? entry.totalCtn)
+    // Snap tiny float residuals (< 0.001 CTN) from FIFO division to zero
+    const availableCtn = (entry.availableCtn ?? 0) < 0.001 ? 0 : entry.availableCtn
+    const soldCtn = entry.totalCtn - availableCtn
     if (soldCtn === 0)
       return (
         <Badge variant="outline" className="border-green-600 text-green-700 bg-green-50 dark:bg-green-950 dark:text-green-300 dark:border-green-700">
           Available
         </Badge>
       )
-    if (entry.availableCtn === 0)
+    if (availableCtn === 0)
       return (
         <Badge variant="outline" className="border-red-600 text-red-700 bg-red-50 dark:bg-red-950 dark:text-red-300 dark:border-red-700">
           Fully Sold
@@ -76,18 +79,18 @@ export function IndiaBuyingEntryTable({
     )
   }
 
-  const fetchEntries = useCallback(async () => {
+  const fetchEntries = useCallback(async (page = currentPage) => {
     setLoading(true)
     const result = await apiGet<{
       entries: IndiaBuyingEntryRow[]
       pagination: { page: number; pages: number; total: number }
-    }>(`/api/india-buying-entries?productId=${productId}&limit=20`)
+    }>(`/api/india-buying-entries?productId=${productId}&limit=20&page=${page}`)
     setLoading(false)
     if (result.success) {
       setEntries(result.data.entries)
       setPagination(result.data.pagination)
     } else toast.error(result.message)
-  }, [productId])
+  }, [productId, currentPage])
 
   useEffect(() => {
     fetchEntries()
@@ -125,7 +128,11 @@ export function IndiaBuyingEntryTable({
     const result = await apiDelete(`/api/india-buying-entries/${entryId}`)
     if (result.success) {
       toast.success('Entry deleted')
-      fetchEntries()
+      if (currentPage === 1) {
+        fetchEntries()
+      } else {
+        setCurrentPage(1)
+      }
       onRefresh()
     } else toast.error(result.message ?? result.error)
   }
@@ -294,6 +301,24 @@ export function IndiaBuyingEntryTable({
           <p className="text-sm text-muted-foreground">
             Page {pagination.page} of {pagination.pages} ({pagination.total} total)
           </p>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage <= 1 || loading}
+              onClick={() => setCurrentPage((p) => p - 1)}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage >= pagination.pages || loading}
+              onClick={() => setCurrentPage((p) => p + 1)}
+            >
+              Next
+            </Button>
+          </div>
         </div>
       )}
     </div>

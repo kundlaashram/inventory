@@ -1,5 +1,6 @@
 import mongoose, { Schema, model, models } from 'mongoose'
 import { round, roundQty } from '@/lib/round'
+import { breakdownAverages, summarizeCbmBreakdown, type CbmBreakdownRow } from '@/lib/cbm-breakdown'
 export interface IBuyingEntry {
   _id?: mongoose.Types.ObjectId
   product: mongoose.Types.ObjectId
@@ -7,9 +8,14 @@ export interface IBuyingEntry {
   totalCtn: number
   qty: number
   rate: number // RMB ¥ per piece
-  cbm: number
+  cbm: number // CBM per CTN — the average of cbmBreakdown when it is set
+  /** Measured carton sizes of the CTN in India (available + sold), e.g. 20 @ 0.012 + 10 @ 0.011.
+   *  Rows may also carry their own carrying / RMB rate — averaged into carryingRate / avgRmbRate. */
+  cbmBreakdown?: CbmBreakdownRow[]
   weight: number
-  givenAmount: number // RMB ¥ — auto: advanceAmount + sum(BuyingPayments)
+  givenAmount: number // RMB ¥ — auto: openingGivenAmount + advanceAmount + sum(BuyingPayments)
+  /** Payments made before a year-end reset, once their BuyingPayment rows were cleared. */
+  openingGivenAmount: number // RMB ¥
   hasAdvancePayment: boolean
   advanceAmount?: number // RMB ¥
   advanceChinaPerson?: mongoose.Types.ObjectId // ref: ChinaPerson (for advance)
@@ -54,8 +60,21 @@ const BuyingEntrySchema = new Schema<IBuyingEntry>(
     qty: { type: Number, required: true },
     rate: { type: Number, required: true },
     cbm: { type: Number, required: true },
+    cbmBreakdown: {
+      type: [
+        {
+          _id: false,
+          ctn: { type: Number, required: true },
+          cbm: { type: Number, required: true },
+          carryingRate: { type: Number },
+          rmbRate: { type: Number },
+        },
+      ],
+      default: undefined,
+    },
     weight: { type: Number, required: true },
     givenAmount: { type: Number, default: 0 },
+    openingGivenAmount: { type: Number, default: 0 },
     hasAdvancePayment: { type: Boolean, default: false },
     advanceAmount: { type: Number },
     advanceChinaPerson: { type: Schema.Types.ObjectId, ref: 'ChinaPerson' },
@@ -105,6 +124,22 @@ BuyingEntrySchema.pre('save', function (next) {
   const doc = this as IBuyingEntry
 
   const totalCtn = doc.totalCtn ?? 0
+
+  // Measured carton sizes: cbm per CTN becomes their average, and so do the
+  // carrying / RMB rates when those columns are filled for every row.
+  // A breakdown with more CTN than the entry has is dropped.
+  if (doc.cbmBreakdown && doc.cbmBreakdown.length > 0) {
+    const summary = summarizeCbmBreakdown(doc.cbmBreakdown)
+    if (!summary.valid || summary.totalCtn > totalCtn + 1e-6) {
+      doc.cbmBreakdown = undefined
+    } else {
+      const avg = breakdownAverages(doc.cbmBreakdown)
+      doc.cbm = avg.cbm
+      if (avg.carryingRate != null) doc.carryingRate = avg.carryingRate
+      if (avg.avgRmbRate != null) doc.avgRmbRate = avg.avgRmbRate
+    }
+  }
+
   const qtyPerCtn = doc.qty ?? 0
   const ratePerPiece = doc.rate ?? 0
   const cbmPerCtn = doc.cbm ?? 0

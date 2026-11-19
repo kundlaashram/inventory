@@ -2,16 +2,21 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { format } from 'date-fns'
-import { Trash2 } from 'lucide-react'
+import { Trash2, FileDown } from 'lucide-react'
 import { StatusBadge } from '@/components/ui/StatusBadge'
 import { AmountDisplay } from '@/components/ui/AmountDisplay'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { DateRangePicker } from '@/components/ui/DateRangePicker'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
+import { ExportPdfButton } from '@/components/ui/ExportPdfButton'
+import { exportTableToPdf } from '@/lib/exportPdf'
 import { apiGet, apiDelete } from '@/lib/api-client'
+import { useDebounce } from '@/hooks/useDebounce'
 import { toast } from 'sonner'
 import type { DateRange } from 'react-day-picker'
+import { useUrlParams, useSyncUrlParams, useOnFiltersChange, dateRangeParams } from '@/hooks/useUrlFilters'
 
 interface Transaction {
   _id: string
@@ -20,6 +25,8 @@ interface Transaction {
   balanceAfter: number
   reference?: string
   buyingEntry?: string
+  /** Opening-balance row from a year-end reset — not deletable. */
+  isOpening?: boolean
   transactionDate: string
   notes?: string
   createdAt: string
@@ -39,10 +46,74 @@ export function TransactionHistory({
   onRefresh?: () => void
   refreshTrigger?: number
 }) {
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
+  const [page, setPage] = useState(() => url.int('page', 1))
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<{ transactions: Transaction[]; pagination: Pagination } | null>(null)
+  const [selectedTypes, setSelectedTypes] = useState<Set<'credit' | 'debit' | 'reversal'>>(() => {
+    const allowed = ['credit', 'debit', 'reversal'] as const
+    return new Set(url.str('types').split(',').filter((t): t is (typeof allowed)[number] => (allowed as readonly string[]).includes(t)))
+  })
+  const [exportingAll, setExportingAll] = useState(false)
+  const [search, setSearch] = useState(() => url.str('search'))
+  const debouncedSearch = useDebounce(search, 400)
+
+  const pdfColumns = ['Date', 'Type', 'Reference', 'Notes', 'Amount', 'Balance After']
+
+  const mapRows = (rows: Transaction[]) =>
+    rows.map((tx) => [
+      format(new Date(tx.transactionDate), 'dd MMM yyyy'),
+      tx.type,
+      tx.reference ?? '',
+      tx.notes ?? '',
+      tx.type === 'debit' ? -tx.amount : tx.amount,
+      tx.balanceAfter,
+    ])
+
+  async function handleExportAll() {
+    try {
+      setExportingAll(true)
+      const params = new URLSearchParams()
+      params.set('page', '1')
+      params.set('limit', '10000')
+      if (dateRange?.from) params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
+      if (dateRange?.to) params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
+      if (selectedTypes.size > 0) params.set('types', Array.from(selectedTypes).join(','))
+      if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
+      const result = await apiGet<{ transactions: Transaction[]; pagination: { page: number; limit: number; total: number; pages: number } }>(
+        `/api/china-bank/transactions?${params}`
+      )
+      if (!result.success) {
+        toast.error(result.message ?? 'Failed to export')
+        return
+      }
+      if (!result.data.transactions.length) {
+        toast.info('No transactions to export')
+        return
+      }
+      exportTableToPdf({
+        title: 'China Bank — Transaction History',
+        columns: pdfColumns,
+        rows: mapRows(result.data.transactions),
+        landscape: true,
+      })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Export failed')
+    } finally {
+      setExportingAll(false)
+    }
+  }
+
+  function toggleType(t: 'credit' | 'debit' | 'reversal') {
+    setSelectedTypes((prev) => {
+      const next = new Set(prev)
+      if (next.has(t)) next.delete(t)
+      else next.add(t)
+      return next
+    })
+    setPage(1)
+  }
 
   const fetchTransactions = useCallback(async () => {
     setLoading(true)
@@ -51,13 +122,24 @@ export function TransactionHistory({
     params.set('limit', '10')
     if (dateRange?.from) params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
     if (dateRange?.to) params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
+    if (selectedTypes.size > 0) params.set('types', Array.from(selectedTypes).join(','))
+    if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
     const result = await apiGet<{ transactions: Transaction[]; pagination: Pagination }>(
       `/api/china-bank/transactions?${params}`
     )
     setLoading(false)
     if (result.success) setData(result.data)
     else toast.error(result.message)
-  }, [page, dateRange?.from, dateRange?.to])
+  }, [page, dateRange?.from, dateRange?.to, selectedTypes, debouncedSearch])
+
+  useOnFiltersChange([debouncedSearch, dateRange?.from, dateRange?.to], () => setPage(1))
+
+  useSyncUrlParams({
+    search: debouncedSearch.trim(),
+    types: Array.from(selectedTypes).sort().join(','),
+    ...dateRangeParams(dateRange),
+    page: page > 1 ? page : undefined,
+  })
 
   useEffect(() => {
     fetchTransactions()
@@ -76,14 +158,51 @@ export function TransactionHistory({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="font-semibold">Transaction History</h3>
-        <DateRangePicker
-          value={dateRange}
-          onChange={setDateRange}
-          placeholder="Filter by date range"
-          className="w-full sm:w-auto"
-        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            placeholder="Search by reference or notes..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full sm:w-[220px]"
+          />
+          <div className="flex gap-1 rounded-md border p-0.5 bg-muted/40">
+            {(['credit', 'debit', 'reversal'] as const).map((t) => (
+              <Button
+                key={t}
+                variant={selectedTypes.has(t) ? 'default' : 'ghost'}
+                size="sm"
+                className="h-7 text-xs capitalize"
+                onClick={() => toggleType(t)}
+              >
+                {t === 'credit' ? '↑ Credit' : t === 'debit' ? '↓ Debit' : '↩ Reversal'}
+              </Button>
+            ))}
+          </div>
+          <DateRangePicker
+            value={dateRange}
+            onChange={(v) => { setDateRange(v); setPage(1) }}
+            placeholder="Filter by date range"
+            className="w-full sm:w-auto"
+          />
+          <ExportPdfButton
+            title="China Bank — Transaction History"
+            landscape
+            columns={pdfColumns}
+            rows={data ? mapRows(data.transactions) : []}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={exportingAll}
+            onClick={handleExportAll}
+            className="gap-2"
+          >
+            <FileDown className="h-4 w-4" />
+            {exportingAll ? 'Exporting...' : 'Export All'}
+          </Button>
+        </div>
       </div>
 
       <div className="rounded-md border">
@@ -128,7 +247,7 @@ export function TransactionHistory({
                       <AmountDisplay amount={tx.balanceAfter} />
                     </td>
                     <td className="p-4">
-                      {(tx.type === 'credit' || tx.type === 'debit') && !tx.buyingEntry ? (
+                      {(tx.type === 'credit' || tx.type === 'debit') && !tx.buyingEntry && !tx.isOpening ? (
                         <ConfirmDialog
                           title="Delete transaction"
                           description={

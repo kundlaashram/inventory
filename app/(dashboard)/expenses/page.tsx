@@ -1,10 +1,11 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { format } from 'date-fns'
 import { Plus, Pencil, Trash2 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Card, CardContent } from '@/components/ui/card'
 import { DateRangePicker } from '@/components/ui/DateRangePicker'
 import { SearchableSelect, type SearchableSelectOption } from '@/components/ui/SearchableSelect'
@@ -12,12 +13,14 @@ import { AmountDisplay } from '@/components/ui/AmountDisplay'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { ExpenseFormDialog, type ExpenseFormValues } from '@/components/expenses/ExpenseFormDialog'
 import { apiGet, apiDelete } from '@/lib/api-client'
+import { useDebounce } from '@/hooks/useDebounce'
 import { toast } from 'sonner'
 import { TableSkeleton } from '@/components/ui/TableSkeleton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { Pagination } from '@/components/ui/Pagination'
 import { Receipt } from 'lucide-react'
 import type { DateRange } from 'react-day-picker'
+import { useUrlParams, useSyncUrlParams, useOnFiltersChange, dateRangeParams } from '@/hooks/useUrlFilters'
 
 interface ExpenseRow {
   _id: string
@@ -32,15 +35,18 @@ interface ExpenseRow {
 interface ExpensesData {
   expenses: ExpenseRow[]
   pagination: { page: number; limit: number; total: number; pages: number }
-  summary: { today: number; thisMonth: number; thisYear: number }
+  summary: { today: number; thisMonth: number; thisYear: number; dateRange: number | null }
 }
 
-export default function ExpensesPage() {
+function ExpensesPageContent() {
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<ExpensesData | null>(null)
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
-  const [paidFromFilter, setPaidFromFilter] = useState('')
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
+  const [paidFromFilter, setPaidFromFilter] = useState(() => url.str('paidFrom'))
+  const [search, setSearch] = useState(() => url.str('search'))
+  const debouncedSearch = useDebounce(search, 400)
+  const [page, setPage] = useState(() => url.int('page', 1))
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingExpense, setEditingExpense] = useState<ExpenseFormValues | null>(null)
   const [accountOptions, setAccountOptions] = useState<SearchableSelectOption<string>[]>([])
@@ -53,11 +59,12 @@ export default function ExpensesPage() {
     if (dateRange?.from) params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
     if (dateRange?.to) params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
     if (paidFromFilter) params.set('paidFrom', paidFromFilter)
+    if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
     const result = await apiGet<ExpensesData>(`/api/expenses?${params}`)
     setLoading(false)
     if (result.success) setData(result.data)
     else toast.error(result.message)
-  }, [page, dateRange?.from, dateRange?.to, paidFromFilter])
+  }, [page, dateRange?.from, dateRange?.to, paidFromFilter, debouncedSearch])
 
   const fetchAccounts = useCallback(async () => {
     const res = await apiGet<{ accounts: { _id: string; accountName: string }[] }>('/api/banks')
@@ -68,6 +75,15 @@ export default function ExpensesPage() {
   useEffect(() => {
     fetchExpenses()
   }, [fetchExpenses])
+
+  useOnFiltersChange([debouncedSearch, dateRange?.from, dateRange?.to, paidFromFilter], () => setPage(1))
+
+  useSyncUrlParams({
+    search: debouncedSearch.trim(),
+    paidFrom: paidFromFilter,
+    ...dateRangeParams(dateRange),
+    page: page > 1 ? page : undefined,
+  })
 
   useEffect(() => {
     fetchAccounts()
@@ -101,7 +117,7 @@ export default function ExpensesPage() {
 
   const expenses = data?.expenses ?? []
   const pagination = data?.pagination ?? { page: 1, limit: 20, total: 0, pages: 0 }
-  const summary = data?.summary ?? { today: 0, thisMonth: 0, thisYear: 0 }
+  const summary = data?.summary ?? { today: 0, thisMonth: 0, thisYear: 0, dateRange: null }
 
   return (
     <div className="space-y-6">
@@ -116,7 +132,7 @@ export default function ExpensesPage() {
         }
       />
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className={`grid gap-4 ${dateRange?.from ? 'grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3'}`}>
         <Card>
           <CardContent className="pt-4">
             <p className="text-sm text-muted-foreground">Total Expenses Today</p>
@@ -141,10 +157,30 @@ export default function ExpensesPage() {
             </p>
           </CardContent>
         </Card>
+        {dateRange?.from && (
+          <Card className="border-primary/40 bg-primary/5">
+            <CardContent className="pt-4">
+              <p className="text-sm text-muted-foreground">
+                {dateRange.to && dateRange.to.getTime() !== dateRange.from.getTime()
+                  ? `${format(dateRange.from, 'dd MMM')} – ${format(dateRange.to, 'dd MMM yyyy')}`
+                  : format(dateRange.from, 'dd MMM yyyy')}
+              </p>
+              <p className="text-2xl font-semibold">
+                <AmountDisplay amount={summary.dateRange ?? 0} />
+              </p>
+            </CardContent>
+          </Card>
+        )}
       </div>
 
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center flex-wrap">
         <div className="flex flex-wrap items-center gap-4">
+          <Input
+            placeholder="Search by title or remark..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-[200px]"
+          />
           <DateRangePicker value={dateRange} onChange={setDateRange} placeholder="Date range" />
           <SearchableSelect
             options={accountOptions}
@@ -237,5 +273,13 @@ export default function ExpensesPage() {
         editExpense={editingExpense}
       />
     </div>
+  )
+}
+
+export default function ExpensesPage() {
+  return (
+    <Suspense fallback={null}>
+      <ExpensesPageContent />
+    </Suspense>
   )
 }

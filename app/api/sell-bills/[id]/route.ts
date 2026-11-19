@@ -2,17 +2,21 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
 import SellBill from '@/models/SellBill'
-import SellBillItem from '@/models/SellBillItem'
+import SellBillItem, { IFifoBreakdownItem } from '@/models/SellBillItem'
 import Company from '@/models/Company'
 import BuyingEntry from '@/models/BuyingEntry'
 import IndiaBuyingEntry from '@/models/IndiaBuyingEntry'
 import CashTransaction from '@/models/CashTransaction'
 import { createCashTransaction } from '@/lib/cash-transaction-helper'
+import BankAccount from '@/models/BankAccount'
+import BankTransaction from '@/models/BankTransaction'
+import { recalculateBankAccountLedger } from '@/lib/bank-ledger'
 import { processFIFO, reverseFIFO, applyFIFO } from '@/lib/fifo'
 import { processIndiaFIFO, reverseIndiaFIFO, applyIndiaFIFO } from '@/lib/india-fifo'
 import { round } from '@/lib/round'
 import { calcGrandTotal } from '@/lib/utils'
 import mongoose from 'mongoose'
+import { ensureCanDelete, ensureNotViewer } from '@/lib/permissions'
 
 /** Reuse existing line's FIFO breakdown when stock wasn't restored (rate-only edit). Re-apply consumption and create item. */
 async function reuseExistingBreakdown(
@@ -73,6 +77,7 @@ export async function GET(
     const bill = await SellBill.findById(id)
       .lean()
       .populate('company')
+      .populate('bankAccount', 'accountName')
       .populate({
         path: 'items',
         populate: [
@@ -116,10 +121,43 @@ export async function GET(
         })
         ;(bill as Record<string, unknown>).totalAmount = Math.round(subtotal * 100) / 100
         ;(bill as Record<string, unknown>).grandTotal = grandTotal
+
+        // The interrupted save also means the original ledger credit was never written.
+        // Backfill it now so the reversal-on-delete has something real to reference.
+        if ((bill as { isCashbook?: boolean }).isCashbook && grandTotal !== 0) {
+          const existingEntry = await CashTransaction.findOne({
+            referenceId: bill._id,
+            referenceType: 'SellBill',
+            isReversal: { $ne: true },
+          }).lean()
+          if (!existingEntry) {
+            await createCashTransaction({
+              type: grandTotal < 0 ? 'debit' : 'credit',
+              amount: Math.abs(grandTotal),
+              description: `Cashbook sale — Bill #${(bill as { billNumber?: number }).billNumber}\n(recovered from interrupted save)`,
+              date: (bill as { billDate?: Date }).billDate ? new Date((bill as { billDate?: Date }).billDate as Date) : new Date(),
+              category: 'cashbook_sale',
+              referenceId: bill._id as mongoose.Types.ObjectId,
+              referenceType: 'SellBill',
+            })
+          }
+        }
       }
     }
 
-    const totalProfit = (items as { totalProfit?: number }[]).reduce((s, i) => s + (i.totalProfit ?? 0), 0)
+    // Gross Profit = Grand Total (revenue after adjustments) − Total FIFO Cost
+    // This correctly reflects extra charges (+) and discounts (−) at the bill level.
+    const totalFifoCost = (items as { fifoBreakdown?: { finalCost?: number; pcsConsumed?: number }[] }[]).reduce(
+      (s, item) =>
+        s + (item.fifoBreakdown ?? []).reduce((c, f) => c + (f.finalCost ?? 0) * (f.pcsConsumed ?? 0), 0),
+      0
+    )
+    const billGrandTotal =
+      (bill as { grandTotal?: number }).grandTotal ??
+      (bill as { totalAmount?: number }).totalAmount ??
+      0
+    const totalProfit = parseFloat((billGrandTotal - totalFifoCost).toFixed(2))
+
     return NextResponse.json({
       success: true,
       data: { ...bill, items, totalProfit },
@@ -161,6 +199,14 @@ export async function PUT(
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -178,15 +224,23 @@ export async function PUT(
     const extraChargesNote = body.extraChargesNote != null ? String(body.extraChargesNote).trim() : ''
     const discount = Number(body.discount) || 0
     const discountNote = body.discountNote != null ? String(body.discountNote).trim() : ''
+    const bankAccountId = body.bankAccountId != null ? String(body.bankAccountId).trim() : ''
 
     const isCashbook = companyId === 'cashbook'
+    const isBankSale = companyId === 'bankaccount'
     if (!companyId) {
       return NextResponse.json(
         { success: false, error: 'Validation failed', message: 'Select company or Cashbook' },
         { status: 400 }
       )
     }
-    if (!isCashbook && !mongoose.Types.ObjectId.isValid(companyId)) {
+    if (isBankSale && !mongoose.Types.ObjectId.isValid(bankAccountId)) {
+      return NextResponse.json(
+        { success: false, error: 'Validation failed', message: 'Select a bank account' },
+        { status: 400 }
+      )
+    }
+    if (!isCashbook && !isBankSale && !mongoose.Types.ObjectId.isValid(companyId)) {
       return NextResponse.json(
         { success: false, error: 'Validation failed', message: 'Valid company is required' },
         { status: 400 }
@@ -243,22 +297,30 @@ export async function PUT(
     }
 
     const existingIsCashbook = (bill as { isCashbook?: boolean }).isCashbook === true
+    const existingIsBankSale = (bill as { isBankSale?: boolean }).isBankSale === true
     const oldGrandTotal =
       (bill as { grandTotal?: number }).grandTotal ??
       (bill as { totalAmount?: number }).totalAmount ??
       0
     const existingCompanyId = (bill as { company?: mongoose.Types.ObjectId }).company
+    const existingBankAccountId = (bill as { bankAccount?: mongoose.Types.ObjectId }).bankAccount
 
-    // Cannot switch cashbook ↔ company on edit
-    if (existingIsCashbook && companyId !== 'cashbook') {
+    // Cannot switch between bill types on edit
+    if (existingIsCashbook && !isCashbook) {
       return NextResponse.json(
-        { success: false, error: 'Validation failed', message: 'Cashbook bills cannot be changed to company bills' },
+        { success: false, error: 'Validation failed', message: 'Cashbook bills cannot be changed to another type' },
         { status: 400 }
       )
     }
-    if (!existingIsCashbook && companyId === 'cashbook') {
+    if (existingIsBankSale && !isBankSale) {
       return NextResponse.json(
-        { success: false, error: 'Validation failed', message: 'Company bills cannot be changed to Cashbook' },
+        { success: false, error: 'Validation failed', message: 'Bank account bills cannot be changed to another type' },
+        { status: 400 }
+      )
+    }
+    if (!existingIsCashbook && !existingIsBankSale && (isCashbook || isBankSale)) {
+      return NextResponse.json(
+        { success: false, error: 'Validation failed', message: 'Company bills cannot be changed to Cashbook or Bank Account' },
         { status: 400 }
       )
     }
@@ -309,7 +371,7 @@ export async function PUT(
 
     // Step 2 — Process new items with FIFO. On any failure, rollback: reverse new items and re-apply original.
     const createdItems: mongoose.Types.ObjectId[] = []
-    const createdBreakdowns: { fifoBreakdown: { buyingEntry?: mongoose.Types.ObjectId; indiaBuyingEntry?: mongoose.Types.ObjectId; ctnConsumed: number }[] }[] = []
+    const createdBreakdowns: { fifoBreakdown: IFifoBreakdownItem[] }[] = []
     let totalAmount = 0
 
     try {
@@ -321,7 +383,7 @@ export async function PUT(
         const productId = new mongoose.Types.ObjectId(row.productId)
         const isIndia = row.productSource === 'india'
         const pcsOnBill = pcsAlreadyOnThisBillByProduct.get(row.productId) ?? 0
-        let fifoBreakdown: { buyingEntry?: mongoose.Types.ObjectId; indiaBuyingEntry?: mongoose.Types.ObjectId; ctnConsumed: number; pcsConsumed?: number; finalCost?: number; profit?: number }[]
+        let fifoBreakdown: IFifoBreakdownItem[]
         let fifoNote: string | undefined
         let totalProfit: number
         let pcsSold: number
@@ -416,7 +478,7 @@ export async function PUT(
     const newGrandTotal = calcGrandTotal(newSubtotal, extraCharges, discount)
     const amountDiff = newGrandTotal - oldGrandTotal
 
-    // Step 3 — Adjust cash or company outstanding by the grand total difference
+    // Step 3 — Adjust cash / bank / company outstanding by the grand total difference
     if (amountDiff !== 0) {
       if (existingIsCashbook) {
         await createCashTransaction({
@@ -429,6 +491,28 @@ export async function PUT(
           referenceType: 'SellBill',
           sortOrder: 1,
         })
+      } else if (existingIsBankSale && existingBankAccountId) {
+        const bankAcc = await BankAccount.findById(existingBankAccountId).select('_id').lean()
+        if (bankAcc) {
+          // balanceAfter is a placeholder — recalculateBankAccountLedger (true
+          // createdAt order) fixes it below. This adjustment is stamped with the
+          // bill's original date, which can sit behind transactions already
+          // recorded after it; a currentBalance mutation here would silently
+          // corrupt the running balance the moment that happens.
+          await BankTransaction.create({
+            bankAccount: existingBankAccountId,
+            type: amountDiff > 0 ? 'credit' : 'debit',
+            amount: Math.abs(amountDiff),
+            balanceAfter: 0,
+            source: 'bankaccount_sale',
+            sourceRef: new mongoose.Types.ObjectId(id),
+            sourceLabel: `Bank bill edited — adjustment for Bill #${(bill as { billNumber?: number }).billNumber ?? id}`,
+            transactionDate: billDate ? new Date(billDate) : new Date(),
+            createdBy: updatedBy,
+            sortOrder: 1,
+          })
+          await recalculateBankAccountLedger(bankAcc._id as mongoose.Types.ObjectId, { updatedBy })
+        }
       } else if (existingCompanyId) {
         await Company.findByIdAndUpdate(existingCompanyId, {
           $inc: { outstanding: amountDiff },
@@ -436,9 +520,11 @@ export async function PUT(
       }
     }
 
-    ;(bill as { company: mongoose.Types.ObjectId | null; isCashbook: boolean; companyName: string | null }).company = isCashbook ? null : new mongoose.Types.ObjectId(companyId)
+    ;(bill as { company: mongoose.Types.ObjectId | null; isCashbook: boolean; isBankSale: boolean; bankAccount: mongoose.Types.ObjectId | null; companyName: string | null }).company = (isCashbook || isBankSale) ? null : new mongoose.Types.ObjectId(companyId)
     ;(bill as { isCashbook: boolean }).isCashbook = !!isCashbook
-    ;(bill as { companyName: string | null }).companyName = isCashbook ? 'Cashbook' : null
+    ;(bill as { isBankSale: boolean }).isBankSale = !!isBankSale
+    ;(bill as { bankAccount: mongoose.Types.ObjectId | null }).bankAccount = isBankSale ? (existingBankAccountId ?? null) : null
+    ;(bill as { companyName: string | null }).companyName = isCashbook ? 'Cashbook' : isBankSale ? ((bill as { companyName?: string }).companyName ?? 'Bank Account') : null
     bill.billDate = new Date(billDate)
     bill.items = createdItems
     bill.totalAmount = newSubtotal
@@ -482,6 +568,14 @@ export async function DELETE(
         { status: 401 }
       )
     }
+    const perm = ensureCanDelete(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -508,12 +602,14 @@ export async function DELETE(
     await SellBillItem.deleteMany({ sellBill: id })
 
     const isCashbook = (bill as { isCashbook?: boolean }).isCashbook === true
+    const isBankSale = (bill as { isBankSale?: boolean }).isBankSale === true
+    const deleteBankAccountId = (bill as { bankAccount?: mongoose.Types.ObjectId }).bankAccount
     const amountToReverse =
       (bill as { grandTotal?: number }).grandTotal ??
       (bill as { totalAmount?: number }).totalAmount ??
       0
     if (isCashbook) {
-      if (amountToReverse > 0) {
+      if (amountToReverse !== 0) {
         const billIdObj = new mongoose.Types.ObjectId(id)
         const originalCashTx = await CashTransaction.findOne({
           referenceId: billIdObj,
@@ -522,23 +618,55 @@ export async function DELETE(
         })
           .sort({ createdAt: 1 })
           .lean()
-        const originalDate = originalCashTx ? (originalCashTx as { date?: Date }).date : (bill as { billDate?: Date }).billDate
-        await createCashTransaction({
-          type: 'debit',
-          amount: amountToReverse,
-          description: `Reversal — Cashbook bill deleted #${(bill as { billNumber?: number }).billNumber ?? id}`,
-          date: originalDate ? new Date(originalDate) : new Date(),
-          category: 'reversal',
-          referenceId: billIdObj,
-          referenceType: 'SellBill',
-          isReversal: true,
-          reversalOf: originalCashTx?._id ?? null,
+        if (!originalCashTx) {
+          // No original credit was ever recorded for this bill (e.g. creation was interrupted
+          // before the ledger entry was written). There is nothing to reverse — writing a debit
+          // here would create an orphaned entry with no matching credit.
+          console.warn(
+            `Skipped cashbook reversal for deleted bill #${(bill as { billNumber?: number }).billNumber ?? id}: no original CashTransaction found for referenceId=${id}`
+          )
+        } else {
+          await createCashTransaction({
+            // Mirror image of the original entry: a negative bill was a debit, so undoing it credits back.
+            type: amountToReverse > 0 ? 'debit' : 'credit',
+            amount: Math.abs(amountToReverse),
+            description: `Reversal — Cashbook bill deleted #${(bill as { billNumber?: number }).billNumber ?? id}`,
+            date: (originalCashTx as { date?: Date }).date ? new Date((originalCashTx as { date?: Date }).date as Date) : new Date(),
+            category: 'reversal',
+            referenceId: billIdObj,
+            referenceType: 'SellBill',
+            isReversal: true,
+            reversalOf: originalCashTx._id,
+            sortOrder: 1,
+          })
+        }
+      }
+    } else if (isBankSale && deleteBankAccountId && amountToReverse !== 0) {
+      const bankAcc = await BankAccount.findById(deleteBankAccountId).select('_id').lean()
+      if (bankAcc) {
+        // balanceAfter is a placeholder — recalculateBankAccountLedger (true
+        // createdAt order) fixes it below; see the edit-adjustment branch above.
+        const reversalCreatedBy =
+          (bill as { createdBy?: mongoose.Types.ObjectId }).createdBy ?? new mongoose.Types.ObjectId()
+        await BankTransaction.create({
+          bankAccount: deleteBankAccountId,
+          type: amountToReverse > 0 ? 'debit' : 'credit',
+          amount: Math.abs(amountToReverse),
+          balanceAfter: 0,
+          source: 'bankaccount_sale',
+          sourceRef: new mongoose.Types.ObjectId(id),
+          sourceLabel: `Reversal — Bank bill deleted #${(bill as { billNumber?: number }).billNumber ?? id}`,
+          transactionDate: (bill as { billDate?: Date }).billDate ?? new Date(),
+          createdBy: reversalCreatedBy,
           sortOrder: 1,
+        })
+        await recalculateBankAccountLedger(bankAcc._id as mongoose.Types.ObjectId, {
+          updatedBy: reversalCreatedBy,
         })
       }
     } else {
       const companyId = (bill as { company?: mongoose.Types.ObjectId }).company
-      if (companyId && amountToReverse > 0) {
+      if (companyId && amountToReverse !== 0) {
         await Company.findByIdAndUpdate(companyId, {
           $inc: { outstanding: -amountToReverse },
         })

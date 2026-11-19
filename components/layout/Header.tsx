@@ -13,6 +13,7 @@ import {
   CheckCircle,
   XCircle,
   Loader2,
+  Maximize2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +26,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useAuthStore } from '@/store/authStore'
+import { useUiStore } from '@/store/uiStore'
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet'
 import { SidebarSheetContent } from '@/components/layout/Sidebar'
 import { ChangePasswordDialog } from '@/components/layout/ChangePasswordDialog'
@@ -42,6 +44,7 @@ const pathTitles: Record<string, string> = {
   '/expenses': 'Expenses',
   '/sophia': 'Sophia',
   '/users': 'Users',
+  '/year-end-reset': 'Year-End Reset',
 }
 
 function getPageTitle(pathname: string): string {
@@ -82,6 +85,7 @@ export function Header() {
   const router = useRouter()
   const { theme, setTheme } = useTheme()
   const { user, clearAuth } = useAuthStore()
+  const enterFullScreen = useUiStore((s) => s.enterFullScreen)
   const [changePasswordOpen, setChangePasswordOpen] = useState(false)
   const [atlasConfigured, setAtlasConfigured] = useState(false)
   const [backupState, setBackupState] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
@@ -215,6 +219,15 @@ export function Header() {
             )}
           </Button>
         )}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={enterFullScreen}
+          title="Full screen"
+          aria-label="Full screen"
+        >
+          <Maximize2 className="h-5 w-5" />
+        </Button>
         <Button
           variant="ghost"
           size="icon"

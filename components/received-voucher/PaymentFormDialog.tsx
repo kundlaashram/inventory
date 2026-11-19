@@ -67,7 +67,7 @@ export function PaymentFormDialog({
     new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(n)
 
   const fetchCompanies = useCallback(async () => {
-    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?limit=500')
+    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?basic=true')
     if (res.success) setCompanyOptions(res.data.companies.map((c) => ({ value: c._id, label: c.companyName })))
   }, [])
   const fetchBanks = useCallback(async () => {
@@ -146,8 +146,8 @@ export function PaymentFormDialog({
       toast.error('Select a company')
       return
     }
-    if (!Number.isFinite(numAmount) || numAmount <= 0) {
-      toast.error('Enter a valid amount')
+    if (!Number.isFinite(numAmount) || numAmount === 0) {
+      toast.error('Enter a valid amount (positive to receive, negative to pay)')
       return
     }
     if (paymentMode === 'online' && !bankAccountId) {
@@ -191,7 +191,7 @@ export function PaymentFormDialog({
   const diff = newAmount - oldAmount
 
   const balanceAfter =
-    hasOutstanding && Number.isFinite(newAmount) && newAmount > 0
+    hasOutstanding && Number.isFinite(newAmount) && newAmount !== 0
       ? isEditMode
         ? outstanding! + oldAmount - newAmount
         : outstanding! - newAmount
@@ -253,12 +253,17 @@ export function PaymentFormDialog({
             <Label htmlFor="amount">Amount (₹)</Label>
             <NumberInput
               id="amount"
-              placeholder="Enter amount"
+              placeholder="Enter amount (negative = paying company)"
               prefix="₹"
               value={amount}
               onChange={setAmount}
-              min={0.01}
+              allowNegative
             />
+            {numAmount < 0 && (
+              <p className="text-xs text-red-600 font-medium">
+                Payment OUT — ₹{formatInr(Math.abs(numAmount))} will be paid to this company from your {paymentMode === 'cash' ? 'cash' : 'bank'}
+              </p>
+            )}
             {hasOutstanding && balanceAfter !== null && !isEditMode && (
               <p
                 className={cn(

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, Suspense } from 'react'
 import Link from 'next/link'
 import { Package, LayoutGrid, List, Plus } from 'lucide-react'
 import { PageHeader } from '@/components/ui/PageHeader'
@@ -15,6 +15,7 @@ import { toast } from 'sonner'
 import { TableSkeleton } from '@/components/ui/TableSkeleton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { Pagination } from '@/components/ui/Pagination'
+import { useUrlParams, useSyncUrlParams, useOnFiltersChange } from '@/hooks/useUrlFilters'
 
 type ViewMode = 'card' | 'table'
 
@@ -27,6 +28,8 @@ interface ProductItem {
   totalCtn: number
   availableCtn: number
   availablePcs: number
+  stockValueINR: number
+  avgFinalCostPerPcs: number
   chinaWarehouseCtn: number
   chinaFactoryCtn: number
   inTransitCtn: number
@@ -38,6 +41,8 @@ interface ProductItem {
   totalCbm: number
   totalWeight: number
   remainingAmount: number
+  lockedAmountRMB: number
+  lockedAmountINR: number
 }
 
 interface IndiaProductItem {
@@ -50,15 +55,17 @@ interface IndiaProductItem {
   availableCtn: number
   availablePcs: number
   availableValue: number
+  avgFinalCostPerPcs: number
   hasUnpaidEntries: boolean
 }
 
-export default function ProductsPage() {
-  const [activeTab, setActiveTab] = useState<'china' | 'india'>('china')
-  const [search, setSearch] = useState('')
-  const [view, setView] = useState<ViewMode>('card')
-  const [page, setPage] = useState(1)
-  const [indiaPage, setIndiaPage] = useState(1)
+function ProductsPageContent() {
+  const url = useUrlParams()
+  const [activeTab, setActiveTab] = useState<'china' | 'india'>(() => url.oneOf('tab', ['china', 'india'], 'china'))
+  const [search, setSearch] = useState(() => url.str('search'))
+  const [view, setView] = useState<ViewMode>(() => url.oneOf('view', ['card', 'table'], 'card'))
+  const [page, setPage] = useState(() => url.int('page', 1))
+  const [indiaPage, setIndiaPage] = useState(() => url.int('indiaPage', 1))
   const [loading, setLoading] = useState(true)
   const [indiaLoading, setIndiaLoading] = useState(true)
   const [data, setData] = useState<{
@@ -73,7 +80,7 @@ export default function ProductsPage() {
       unpaid: number
     }
     pagination: { page: number; limit: number; total: number; pages: number }
-    totals?: { cbm: number; weight: number; remainingToPay: number }
+    totals?: { cbm: number; weight: number; remainingToPay: number; lockedAmountRMB: number; lockedAmountINR: number; stockValueINR: number }
   } | null>(null)
   const [indiaData, setIndiaData] = useState<{
     products: IndiaProductItem[]
@@ -87,7 +94,8 @@ export default function ProductsPage() {
   const [indiaFilter, setIndiaFilter] = useState<IndiaFilterType>(() => {
     if (typeof window === 'undefined') return 'all'
     const s = sessionStorage.getItem(INDIA_FILTER_KEY)
-    return (INDIA_ALLOWED_FILTERS.includes(s as IndiaFilterType) ? s : 'all') as IndiaFilterType
+    const stored = (INDIA_ALLOWED_FILTERS.includes(s as IndiaFilterType) ? s : 'all') as IndiaFilterType
+    return url.oneOf('indiaFilter', INDIA_ALLOWED_FILTERS, stored)
   })
   const [dialogOpen, setDialogOpen] = useState(false)
   const [indiaDialogOpen, setIndiaDialogOpen] = useState(false)
@@ -98,9 +106,12 @@ export default function ProductsPage() {
   const [chinaFilter, setChinaFilter] = useState<ChinaFilterType>(() => {
     if (typeof window === 'undefined') return 'all'
     const s = sessionStorage.getItem(CHINA_FILTER_KEY)
-    return (ALLOWED_FILTERS.includes(s as ChinaFilterType) ? s : 'all') as ChinaFilterType
+    const stored = (ALLOWED_FILTERS.includes(s as ChinaFilterType) ? s : 'all') as ChinaFilterType
+    return url.oneOf('chinaFilter', ALLOWED_FILTERS, stored)
   })
   const debouncedSearch = useDebounce(search, 400)
+  const [minAvailableCtn, setMinAvailableCtn] = useState(() => url.str('minCtn'))
+  const debouncedMinAvailableCtn = useDebounce(minAvailableCtn, 400)
 
   const handleChinaFilterChange = (value: ChinaFilterType) => {
     setChinaFilter(value)
@@ -124,9 +135,10 @@ export default function ProductsPage() {
     setLoading(true)
     const params = new URLSearchParams()
     params.set('page', String(page))
-    params.set('limit', '100')
+    params.set('limit', '200')
     if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
     params.set('filter', chinaFilter)
+    if (debouncedMinAvailableCtn.trim()) params.set('minAvailableCtn', debouncedMinAvailableCtn.trim())
     const result = await apiGet<{
       products: ProductItem[]
       counts: {
@@ -139,12 +151,12 @@ export default function ProductsPage() {
         unpaid: number
       }
       pagination: { page: number; limit: number; total: number; pages: number }
-      totals?: { cbm: number; weight: number; remainingToPay: number }
+      totals?: { cbm: number; weight: number; remainingToPay: number; lockedAmountRMB: number; lockedAmountINR: number; stockValueINR: number }
     }>(`/api/products?${params}`)
     setLoading(false)
     if (result.success) setData(result.data)
     else toast.error(result.message)
-  }, [page, debouncedSearch, chinaFilter])
+  }, [page, debouncedSearch, chinaFilter, debouncedMinAvailableCtn])
 
   const fetchIndiaProducts = useCallback(async () => {
     setIndiaLoading(true)
@@ -165,14 +177,20 @@ export default function ProductsPage() {
     if (activeTab === 'china') fetchProducts()
   }, [activeTab, fetchProducts])
 
-  // Reset to first page when filter or search changes
-  useEffect(() => {
-    setPage(1)
-  }, [chinaFilter, debouncedSearch])
+  // Reset to first page when filter or search changes (not on mount, so a page from the URL is kept)
+  useOnFiltersChange([chinaFilter, debouncedSearch, debouncedMinAvailableCtn], () => setPage(1))
+  useOnFiltersChange([indiaFilter, debouncedSearch], () => setIndiaPage(1))
 
-  useEffect(() => {
-    setIndiaPage(1)
-  }, [indiaFilter, debouncedSearch])
+  useSyncUrlParams({
+    tab: activeTab !== 'china' ? activeTab : undefined,
+    search: debouncedSearch.trim(),
+    view: view !== 'card' ? view : undefined,
+    chinaFilter: chinaFilter !== 'all' ? chinaFilter : undefined,
+    minCtn: debouncedMinAvailableCtn.trim() || undefined,
+    indiaFilter: indiaFilter !== 'all' ? indiaFilter : undefined,
+    page: page > 1 ? page : undefined,
+    indiaPage: indiaPage > 1 ? indiaPage : undefined,
+  })
 
   useEffect(() => {
     if (activeTab === 'india') fetchIndiaProducts()
@@ -343,55 +361,96 @@ export default function ProductsPage() {
                     })}
                   </p>
                 </div>
+                {(data.totals?.stockValueINR ?? 0) > 0 && (
+                  <div className="rounded-lg border bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 px-3 py-2">
+                    <p className="text-[11px] text-emerald-700 dark:text-emerald-400 uppercase tracking-wide">
+                      Total Stock Value
+                    </p>
+                    <p className="text-sm font-semibold tabular-nums text-emerald-700 dark:text-emerald-400">
+                      ₹{(data.totals?.stockValueINR ?? 0).toLocaleString('en-IN', {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}
+                    </p>
+                  </div>
+                )}
+                {(data.totals?.lockedAmountRMB ?? 0) > 0 && (
+                  <div className="rounded-lg border bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800 px-3 py-2">
+                    <p className="text-[11px] text-blue-700 dark:text-blue-400 uppercase tracking-wide">
+                      🔒 Locked (¥)
+                    </p>
+                    <p className="text-sm font-semibold tabular-nums text-blue-700 dark:text-blue-400">
+                      ¥{(data.totals?.lockedAmountRMB ?? 0).toLocaleString('en-IN', {
+                        maximumFractionDigits: 0,
+                      })}
+                    </p>
+                  </div>
+                )}
+                {(data.totals?.lockedAmountINR ?? 0) > 0 && (
+                  <div className="rounded-lg border bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800 px-3 py-2">
+                    <p className="text-[11px] text-blue-700 dark:text-blue-400 uppercase tracking-wide">
+                      🔒 Locked (₹)
+                    </p>
+                    <p className="text-sm font-semibold tabular-nums text-blue-700 dark:text-blue-400">
+                      ₹{(data.totals?.lockedAmountINR ?? 0).toLocaleString('en-IN', {
+                        maximumFractionDigits: 0,
+                      })}
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
-          {currentLoading ? (
-            <TableSkeleton rows={8} columns={5} />
-          ) : !data?.products.length ? (
-            <EmptyState
-              icon={Package}
-              title="No China products yet"
-              description="Add your first China product to track buying entries and stock."
-            >
-              <Button onClick={() => { setEditingProduct(null); setDialogOpen(true); }}>
-                <Plus className="mr-2 h-4 w-4" />
-                Add China Product
-              </Button>
-            </EmptyState>
-          ) : view === 'card' ? (
+          {data && (
+            <div className="flex flex-wrap items-center gap-2 my-3">
+              {[
+                { id: 'all', label: 'All', icon: '', count: data.counts.all },
+                { id: 'chinaFactory', label: '🏭 China Factory', icon: '', count: data.counts.chinaFactory },
+                { id: 'chinaWh', label: '🟡 China WH', icon: '', count: data.counts.chinaWh },
+                { id: 'inTransit', label: '🔵 In Transit', icon: '', count: data.counts.inTransit },
+                { id: 'inIndia', label: '🟢 In India', icon: '', count: data.counts.inIndia },
+                { id: 'fullySold', label: '📦 Fully Sold', icon: '', count: data.counts.fullySold },
+                { id: 'unpaid', label: '🔴 Unpaid', icon: '', count: data.counts.unpaid },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => handleChinaFilterChange(f.id as ChinaFilterType)}
+                  className={`rounded-full px-3 py-1 text-xs transition-colors ${chinaFilter === f.id
+                      ? 'bg-foreground text-background'
+                      : 'bg-muted text-muted-foreground'
+                    }`}
+                >
+                  <span>{f.label}</span>
+                  <span
+                    className={`ml-1 inline-flex items-center rounded-full px-1.5 text-[10px] ${chinaFilter === f.id ? 'bg-white/20' : 'bg-background/60'
+                      }`}
+                  >
+                    {f.count}
+                  </span>
+                </button>
+              ))}
+              <label
+                className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors ${minAvailableCtn.trim()
+                    ? 'bg-foreground text-background'
+                    : 'bg-muted text-muted-foreground'
+                  }`}
+              >
+                <span>Available CTN ≥</span>
+                <input
+                  type="number"
+                  min={0}
+                  inputMode="numeric"
+                  value={minAvailableCtn}
+                  onChange={(e) => setMinAvailableCtn(e.target.value)}
+                  placeholder="0"
+                  className="w-12 bg-transparent text-xs outline-none placeholder:text-muted-foreground/60 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                />
+              </label>
+            </div>
+          )}
+          {!currentLoading && (
             <>
-              {data && (
-                <div className="flex flex-wrap items-center gap-2 my-3">
-                  {[
-                    { id: 'all', label: 'All', icon: '', count: data.counts.all },
-                    { id: 'chinaFactory', label: '🏭 China Factory', icon: '', count: data.counts.chinaFactory },
-                    { id: 'chinaWh', label: '🟡 China WH', icon: '', count: data.counts.chinaWh },
-                    { id: 'inTransit', label: '🔵 In Transit', icon: '', count: data.counts.inTransit },
-                    { id: 'inIndia', label: '🟢 In India', icon: '', count: data.counts.inIndia },
-                    { id: 'fullySold', label: '📦 Fully Sold', icon: '', count: data.counts.fullySold },
-                    { id: 'unpaid', label: '🔴 Unpaid', icon: '', count: data.counts.unpaid },
-                  ].map((f) => (
-                    <button
-                      key={f.id}
-                      type="button"
-                      onClick={() => handleChinaFilterChange(f.id as ChinaFilterType)}
-                      className={`rounded-full px-3 py-1 text-xs transition-colors ${chinaFilter === f.id
-                          ? 'bg-foreground text-background'
-                          : 'bg-muted text-muted-foreground'
-                        }`}
-                    >
-                      <span>{f.label}</span>
-                      <span
-                        className={`ml-1 inline-flex items-center rounded-full px-1.5 text-[10px] ${chinaFilter === f.id ? 'bg-white/20' : 'bg-background/60'
-                          }`}
-                      >
-                        {f.count}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
               {filteredChinaProducts.length > 0 && (
                 <div className="mb-3">
                   <div className="flex flex-wrap gap-2 p-3 bg-muted rounded-lg border items-center">
@@ -471,6 +530,27 @@ export default function ProductsPage() {
                   </div>
                 </div>
               )}
+            </>
+          )}
+          {currentLoading ? (
+            <TableSkeleton rows={8} columns={5} />
+          ) : !data?.products.length ? (
+            <EmptyState
+              icon={Package}
+              title={debouncedSearch.trim() || chinaFilter !== 'all' ? 'No products match your search or filter' : 'No China products yet'}
+              description={
+                debouncedSearch.trim() || chinaFilter !== 'all'
+                  ? 'Try a different search term or select another filter above.'
+                  : 'Add your first China product to track buying entries and stock.'
+              }
+            >
+              <Button onClick={() => { setEditingProduct(null); setDialogOpen(true); }}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add China Product
+              </Button>
+            </EmptyState>
+          ) : view === 'card' ? (
+            <>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 {filteredChinaProducts.map((p) => (
                   <ProductCard
@@ -482,6 +562,8 @@ export default function ProductsPage() {
                     totalCtn={p.totalCtn}
                     availableCtn={p.availableCtn}
                     availablePcs={p.availablePcs}
+                    availableValue={p.stockValueINR}
+                    avgFinalCostPerPcs={p.avgFinalCostPerPcs}
                     chinaFactoryCtn={p.chinaFactoryCtn}
                     chinaWarehouseCtn={p.chinaWarehouseCtn}
                     inTransitCtn={p.inTransitCtn}
@@ -493,6 +575,8 @@ export default function ProductsPage() {
                     totalCbm={p.totalCbm}
                     totalWeight={p.totalWeight}
                     remainingAmount={p.remainingAmount}
+                    lockedAmountRMB={p.lockedAmountRMB}
+                    lockedAmountINR={p.lockedAmountINR}
                   />
                 ))}
               </div>
@@ -509,6 +593,7 @@ export default function ProductsPage() {
                       <th className="h-10 px-4 text-right font-medium text-blue-600">In Transit</th>
                       <th className="h-10 px-4 text-right font-medium text-emerald-600">Available</th>
                       <th className="h-10 px-4 text-right font-medium text-red-500">Sold</th>
+                      <th className="h-10 px-4 text-right font-medium text-emerald-600">Stock Value (₹)</th>
                       <th className="h-10 px-4 text-right font-medium">Entries</th>
                       <th className="h-10 px-4 text-left font-medium">Status</th>
                       <th className="h-10 w-24 px-4" />
@@ -536,6 +621,12 @@ export default function ProductsPage() {
                             }`}
                         >
                           {p.soldCtn}
+                        </td>
+                        <td className="p-4 text-right text-emerald-600">
+                          ₹{p.stockValueINR.toLocaleString('en-IN', {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
                         </td>
                         <td className="p-4 text-right">{p.buyingEntriesCount}</td>
                         <td className="p-4">
@@ -681,14 +772,14 @@ export default function ProductsPage() {
               {!indiaData?.products.length ? (
                 <EmptyState
                   icon={Package}
-                  title={indiaFilter !== 'all' ? 'No products match this filter' : 'No India products yet'}
+                  title={indiaFilter !== 'all' || debouncedSearch.trim() ? 'No products match your search or filter' : 'No India products yet'}
                   description={
-                    indiaFilter !== 'all'
-                      ? 'Try selecting a different filter above.'
+                    indiaFilter !== 'all' || debouncedSearch.trim()
+                      ? 'Try a different search term or select another filter above.'
                       : 'Add your first India product to track buying entries and stock.'
                   }
                 >
-                  {indiaFilter === 'all' && (
+                  {indiaFilter === 'all' && !debouncedSearch.trim() && (
                     <Button onClick={() => setIndiaDialogOpen(true)}>
                       <Plus className="mr-2 h-4 w-4" />
                       Add India Product
@@ -708,6 +799,7 @@ export default function ProductsPage() {
                       availableCtn={p.availableCtn}
                       availablePcs={p.availablePcs}
                       availableValue={p.availableValue}
+                      avgFinalCostPerPcs={p.avgFinalCostPerPcs}
                       hasUnpaidEntries={p.hasUnpaidEntries}
                       detailHref={`/products/india/${p._id}`}
                     />
@@ -782,5 +874,13 @@ export default function ProductsPage() {
         submitLabel="Create"
       />
     </div>
+  )
+}
+
+export default function ProductsPage() {
+  return (
+    <Suspense fallback={null}>
+      <ProductsPageContent />
+    </Suspense>
   )
 }

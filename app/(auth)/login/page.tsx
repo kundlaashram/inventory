@@ -1,29 +1,22 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { useForm } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { useAuthStore } from '@/store/authStore'
 
-const loginSchema = z.object({
-  email: z.string().email('Invalid email'),
-  password: z.string().min(1, 'Password is required'),
-})
-
-type LoginForm = z.infer<typeof loginSchema>
+// The password is tried on its own once typing pauses, so phones need no
+// Enter key. Probes are deduped and never counted as failed logins server-side.
+const PROBE_DELAY_MS = 700
+const MIN_PROBE_LENGTH = 4
 
 export default function LoginPage() {
   const router = useRouter()
   const setAuth = useAuthStore((s) => s.setAuth)
   const clearAuth = useAuthStore((s) => s.clearAuth)
-  const [showPassword, setShowPassword] = useState(false)
-  const [submitError, setSubmitError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const triedRef = useRef<Set<string>>(new Set())
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -46,100 +39,91 @@ export default function LoginPage() {
     }
   }, [router, clearAuth])
 
-  const {
-    register,
-    handleSubmit,
-    formState: { errors, isSubmitting },
-  } = useForm<LoginForm>({
-    resolver: zodResolver(loginSchema),
-    defaultValues: { email: '', password: '' },
-  })
-
-  async function onSubmit(data: LoginForm) {
-    setSubmitError(null)
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      })
-      const json = await res.json()
-
-      if (!json.success) {
-        setSubmitError(json.message ?? json.error ?? 'Login failed')
-        return
-      }
-
-      setAuth(json.data.user, json.data.token)
-      router.push('/')
-      router.refresh()
-    } catch {
-      setSubmitError('Something went wrong. Please try again.')
+  // The box is invisible, so keep it focused: a tap anywhere types into it and
+  // opens the on-screen keyboard on mobile.
+  useEffect(() => {
+    const focus = () => inputRef.current?.focus()
+    focus()
+    window.addEventListener('pointerdown', focus)
+    window.addEventListener('touchend', focus)
+    window.addEventListener('keydown', focus)
+    return () => {
+      window.removeEventListener('pointerdown', focus)
+      window.removeEventListener('touchend', focus)
+      window.removeEventListener('keydown', focus)
     }
-  }
+  }, [])
+
+  const attempt = useCallback(
+    async (candidate: string, probe: boolean) => {
+      if (!candidate) return
+      if (probe && triedRef.current.has(candidate)) return
+      if (probe) triedRef.current.add(candidate)
+
+      setBusy(true)
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: candidate, probe }),
+        })
+        const json = await res.json()
+
+        // Nothing is shown on a failure. A probe leaves the text alone so it
+        // can keep being typed; an explicit submit clears it for a retry.
+        if (!json.success) {
+          if (!probe) setPassword('')
+          return
+        }
+
+        setAuth(json.data.user, json.data.token)
+        router.push('/')
+        router.refresh()
+      } catch {
+        if (!probe) setPassword('')
+      } finally {
+        setBusy(false)
+      }
+    },
+    [router, setAuth]
+  )
+
+  useEffect(() => {
+    if (busy || password.length < MIN_PROBE_LENGTH) return
+    if (triedRef.current.has(password)) return
+    const timer = setTimeout(() => void attempt(password, true), PROBE_DELAY_MS)
+    return () => clearTimeout(timer)
+  }, [password, busy, attempt])
 
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center bg-muted/30 p-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="space-y-1 text-center">
-          <CardTitle className="text-2xl">Import Export Management</CardTitle>
-          <p className="text-sm text-muted-foreground">
-            Sign in to your account
-          </p>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
-              <Input
-                id="email"
-                type="email"
-                placeholder="Email"
-                autoComplete="email"
-                {...register('email')}
-                className={errors.email ? 'border-destructive' : ''}
-              />
-              {errors.email && (
-                <p className="text-sm text-destructive">
-                  {errors.email.message}
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
-              <div className="relative">
-                <Input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  placeholder="••••••••"
-                  autoComplete="current-password"
-                  {...register('password')}
-                  className={errors.password ? 'border-destructive' : ''}
-                />
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  onClick={() => setShowPassword((s) => !s)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground hover:text-foreground"
-                >
-                  {showPassword ? 'Hide' : 'Show'}
-                </button>
-              </div>
-              {errors.password && (
-                <p className="text-sm text-destructive">
-                  {errors.password.message}
-                </p>
-              )}
-            </div>
-            {submitError && (
-              <p className="text-sm text-destructive">{submitError}</p>
-            )}
-            <Button type="submit" className="w-full" disabled={isSubmitting}>
-              {isSubmitting ? 'Signing in…' : 'Sign in'}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
+    <main className="relative flex min-h-screen flex-col items-center justify-center bg-muted/30 p-4">
+      <input
+        ref={inputRef}
+        type="password"
+        autoFocus
+        autoComplete="current-password"
+        enterKeyHint="go"
+        aria-label="Password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            void attempt(password, false)
+          }
+          if (e.key === 'Escape') {
+            setPassword('')
+          }
+        }}
+        className="absolute inset-0 h-full w-full cursor-default border-0 bg-transparent p-0 text-transparent caret-transparent opacity-0 outline-none focus:outline-none focus:ring-0"
+      />
+
+      <div className="pointer-events-none flex flex-col items-center gap-2 text-center">
+        <span className="text-base" aria-hidden="true">
+          🚀
+        </span>
+        <p className="text-sm text-muted-foreground">Server not found</p>
+      </div>
     </main>
   )
 }

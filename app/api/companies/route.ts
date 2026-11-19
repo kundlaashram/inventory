@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import Company from '@/models/Company'
 import SellBill from '@/models/SellBill'
 import SellBillItem from '@/models/SellBillItem'
@@ -20,6 +21,7 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url)
     const page = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10))
     const limit = Math.min(100, Math.max(1, parseInt(searchParams.get('limit') ?? '20', 10)))
+    const basic = searchParams.get('basic') === 'true'
     const search = searchParams.get('search')?.trim() ?? ''
     const outstandingFilterParam = searchParams.get('outstandingFilter')?.trim() ?? 'all'
     const outstandingFilter = ['all', 'positive', 'negative', 'clear'].includes(outstandingFilterParam)
@@ -55,6 +57,41 @@ export async function GET(req: NextRequest) {
         { contact2Mobile: new RegExp(search, 'i') },
         { primaryMobile: new RegExp(search, 'i') },
       ]
+    }
+
+    // Lightweight mode for selector dropdowns: return ALL matching companies
+    // (no pagination cap) with just id + name + outstanding. Skips the heavy
+    // per-company profit/sales/alert aggregation used by the companies list page.
+    if (basic) {
+      const companies = await Company.find(filter)
+        .select('companyName openingBalance')
+        .sort({ companyName: 1 })
+        .lean()
+
+      const ids = companies.map((c) => c._id)
+      const [billedAgg, receivedAgg] = await Promise.all([
+        SellBill.aggregate([
+          { $match: { company: { $in: ids } } },
+          { $group: { _id: '$company', total: { $sum: { $ifNull: ['$grandTotal', '$totalAmount'] } } } },
+        ]),
+        PaymentReceipt.aggregate([
+          { $match: { company: { $in: ids } } },
+          { $group: { _id: '$company', total: { $sum: '$amount' } } },
+        ]),
+      ])
+      const billedByCompany = Object.fromEntries(billedAgg.map((r) => [String(r._id), r.total]))
+      const receivedByCompany = Object.fromEntries(receivedAgg.map((r) => [String(r._id), r.total]))
+
+      const list = companies.map((c) => ({
+        _id: c._id,
+        companyName: c.companyName,
+        outstandingBalance:
+          (billedByCompany[String(c._id)] ?? 0) -
+          (receivedByCompany[String(c._id)] ?? 0) +
+          (c.openingBalance || 0),
+      }))
+
+      return NextResponse.json({ success: true, data: { companies: list } })
     }
 
     const skip = (page - 1) * limit
@@ -141,22 +178,77 @@ export async function GET(req: NextRequest) {
     const pageCompanies = filtered.slice(skip, skip + limit)
 
     const pageCompanyIds = pageCompanies.map((c) => c._id)
+
+    const daysAgo = (d: number) => {
+      const dt = new Date()
+      dt.setDate(dt.getDate() - d)
+      dt.setHours(0, 0, 0, 0)
+      return dt
+    }
+
     let profitByCompany: Record<string, number> = {}
+    let sales7ByCompany: Record<string, number> = {}
+    let sales14ByCompany: Record<string, number> = {}
+    let sales21ByCompany: Record<string, number> = {}
     if (pageCompanyIds.length > 0) {
-      const profitAgg = await SellBillItem.aggregate([
-        { $lookup: { from: 'sellbills', localField: 'sellBill', foreignField: '_id', as: 'bill' } },
-        { $unwind: '$bill' },
-        { $match: { 'bill.company': { $in: pageCompanyIds } } },
-        { $group: { _id: '$bill.company', total: { $sum: '$totalProfit' } } },
+      const [profitAgg, s7Agg, s14Agg, s21Agg] = await Promise.all([
+        SellBillItem.aggregate([
+          { $lookup: { from: 'sellbills', localField: 'sellBill', foreignField: '_id', as: 'bill' } },
+          { $unwind: '$bill' },
+          { $match: { 'bill.company': { $in: pageCompanyIds } } },
+          {
+            $addFields: {
+              itemCost: {
+                $reduce: {
+                  input: { $ifNull: ['$fifoBreakdown', []] },
+                  initialValue: 0,
+                  in: { $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }] },
+                },
+              },
+              adjustedRevenue: {
+                $cond: [
+                  { $gt: ['$bill.totalAmount', 0] },
+                  { $multiply: ['$totalAmount', { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] }] },
+                  '$totalAmount',
+                ],
+              },
+            },
+          },
+          { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
+          { $group: { _id: '$bill.company', total: { $sum: '$adjustedProfit' } } },
+        ]),
+        SellBill.aggregate([
+          { $match: { company: { $in: pageCompanyIds }, createdAt: { $gte: daysAgo(7) } } },
+          { $group: { _id: '$company', total: { $sum: { $ifNull: ['$grandTotal', '$totalAmount'] } } } },
+        ]),
+        SellBill.aggregate([
+          { $match: { company: { $in: pageCompanyIds }, createdAt: { $gte: daysAgo(14) } } },
+          { $group: { _id: '$company', total: { $sum: { $ifNull: ['$grandTotal', '$totalAmount'] } } } },
+        ]),
+        SellBill.aggregate([
+          { $match: { company: { $in: pageCompanyIds }, createdAt: { $gte: daysAgo(21) } } },
+          { $group: { _id: '$company', total: { $sum: { $ifNull: ['$grandTotal', '$totalAmount'] } } } },
+        ]),
       ])
       profitByCompany = Object.fromEntries(profitAgg.map((r) => [String(r._id), r.total]))
+      sales7ByCompany  = Object.fromEntries(s7Agg.map((r)  => [String(r._id), r.total]))
+      sales14ByCompany = Object.fromEntries(s14Agg.map((r) => [String(r._id), r.total]))
+      sales21ByCompany = Object.fromEntries(s21Agg.map((r) => [String(r._id), r.total]))
     }
 
     const list = pageCompanies.map((c) => {
       const totalProfit = profitByCompany[String(c._id)] ?? 0
+      const outstanding = c.outstandingBalance as number
+      let alertLevel = 0
+      if (outstanding > 0) {
+        if (outstanding > (sales21ByCompany[String(c._id)] ?? 0)) alertLevel = 3
+        else if (outstanding > (sales14ByCompany[String(c._id)] ?? 0)) alertLevel = 2
+        else if (outstanding > (sales7ByCompany[String(c._id)] ?? 0)) alertLevel = 1
+      }
       return {
         ...c,
         totalProfit,
+        alertLevel,
       }
     })
 
@@ -205,6 +297,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     if (!createSchema.companyName(body.companyName)) {
       return NextResponse.json(
@@ -223,6 +323,7 @@ export async function POST(req: NextRequest) {
           ? String(body.ownerName).trim()
           : undefined,
       openingBalance: typeof body.openingBalance === 'number' ? body.openingBalance : 0,
+      excludeFromRevenue: body.excludeFromRevenue === true,
       openingBalanceNotes:
         body.openingBalanceNotes != null && body.openingBalanceNotes !== ''
           ? String(body.openingBalanceNotes).trim()

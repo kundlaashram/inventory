@@ -275,6 +275,11 @@ export function BillTemplate({
   return (
     <Document>
       <Page size="A4" style={styles.page}>
+        {/* INVOICE TITLE */}
+        <View style={{ alignItems: 'center', marginBottom: 16 }}>
+          <Text style={{ fontSize: 15, fontFamily: 'Times-Bold', color: '#111827', letterSpacing: 0.5 }}>INVOICE</Text>
+        </View>
+
         {/* BILL TO */}
         <View style={styles.toSection}>
           <View>
@@ -320,12 +325,15 @@ export function BillTemplate({
 
         {/* TOTALS */}
         <View style={styles.totalsSection}>
-          <View style={styles.totalRow}>
-            <Text style={styles.totalLabel}>Subtotal</Text>
-            <Text style={styles.totalValue}>
-              {formatINR(bill.totalAmount)}
-            </Text>
-          </View>
+          {((bill.extraCharges != null && bill.extraCharges > 0) ||
+            (bill.discount != null && bill.discount > 0)) && (
+            <View style={styles.totalRow}>
+              <Text style={styles.totalLabel}>Subtotal</Text>
+              <Text style={styles.totalValue}>
+                {formatINR(bill.totalAmount)}
+              </Text>
+            </View>
+          )}
           {bill.extraCharges != null && bill.extraCharges > 0 && (
             <View style={styles.totalRow}>
               <Text style={styles.totalLabel}>

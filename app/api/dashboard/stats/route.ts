@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
 import BankAccount from '@/models/BankAccount'
+import BankTransaction from '@/models/BankTransaction'
+import Cash from '@/models/Cash'
 import ChinaBankTransaction from '@/models/ChinaBankTransaction'
 import SellBill from '@/models/SellBill'
 import SellBillItem from '@/models/SellBillItem'
@@ -12,12 +14,16 @@ import ChinaPerson from '@/models/ChinaPerson'
 import Expense from '@/models/Expense'
 import Company from '@/models/Company'
 import Product from '@/models/Product'
+import IndiaProduct from '@/models/IndiaProduct'
 import Container from '@/models/Container'
+import Liability from '@/models/Liability'
+import Investment from '@/models/Investment'
 import mongoose from 'mongoose'
+import { countedIn, loadRevenueExclusion } from '@/lib/revenue-exclusion'
 
 export const revalidate = 300
 
-type Period = 'today' | 'week' | 'month' | 'year' | 'custom'
+type Period = 'today' | 'yesterday' | 'week' | 'month' | 'year' | 'custom'
 
 function startOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0)
@@ -38,6 +44,10 @@ function getPeriodRange(period: Period, startDate?: string | null, endDate?: str
   }
   if (period === 'today') {
     return { start: startOfDay(now), end: endOfDay(now) }
+  }
+  if (period === 'yesterday') {
+    const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+    return { start: startOfDay(yesterday), end: endOfDay(yesterday) }
   }
   if (period === 'week') {
     const day = now.getDay()
@@ -70,7 +80,7 @@ export async function GET(req: NextRequest) {
 
     const { searchParams } = new URL(req.url)
     const periodParam = (searchParams.get('period') ?? 'month') as Period
-    const period: Period = ['today', 'week', 'month', 'year', 'custom'].includes(periodParam)
+    const period: Period = ['today', 'yesterday', 'week', 'month', 'year', 'custom'].includes(periodParam)
       ? periodParam
       : 'month'
     const startDate = searchParams.get('startDate')?.trim()
@@ -78,19 +88,23 @@ export async function GET(req: NextRequest) {
     const { start, end } = getPeriodRange(period, startDate, endDate)
 
     await connectDB()
+    // Companies flagged "Exclude from revenue": out of Revenue / Cost, profit still counts
+    const excludedIds = (await loadRevenueExclusion(Company, searchParams)).ids
     // Ensure referenced models are registered for populate calls
     void Product
+    void IndiaProduct
     void Company
 
     const now = new Date()
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
     const monthEnd = endOfDay(new Date(now.getFullYear(), now.getMonth() + 1, 0))
 
-    const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1)
+    // Monthly comparison covers the last 12 months; the dashboard can show 6 or 12
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 11, 1)
 
     const [
       chinaBankLastTx,
-      cashAccount,
+      _cashAccount,
       billedAgg,
       receivedAgg,
       pendingChina,
@@ -98,7 +112,7 @@ export async function GET(req: NextRequest) {
       chinaInventoryAgg,
       indiaInventoryAgg,
       chinaBankDebitsThisMonth,
-      readyToLockCount,
+      readyToLockEntries,
       periodBoughtAgg,
       periodSoldAgg,
       topProductsAgg,
@@ -178,22 +192,27 @@ export async function GET(req: NextRequest) {
         },
         { $group: { _id: null, total: { $sum: '$value' } } },
       ]),
-      // China bank debits this month
-      ChinaBankTransaction.aggregate([
+      // Entries locked this month — sum lockedAmount from BuyingEntry to avoid
+      // double-counting re-locks (which create a reversal + new debit in ChinaBankTransaction)
+      BuyingEntry.aggregate([
         {
           $match: {
-            type: 'debit',
-            transactionDate: { $gte: monthStart, $lte: monthEnd },
+            isLocked: true,
+            lockedAt: { $gte: monthStart, $lte: monthEnd },
           },
         },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
+        { $group: { _id: null, total: { $sum: '$lockedAmount' } } },
       ]),
-      // Entries ready to lock
-      BuyingEntry.countDocuments({
+      // Entries ready to lock — must have rates set, received in China WH, and not yet locked
+      BuyingEntry.find({
         avgRmbRate: { $gt: 0 },
         carryingRate: { $gt: 0 },
+        chinaWarehouseReceived: 'yes',
         isLocked: false,
-      }),
+      })
+        .select('product mark')
+        .populate('product', 'productName')
+        .lean(),
       // CTN bought this period
       BuyingEntry.aggregate([
         {
@@ -258,15 +277,37 @@ export async function GET(req: NextRequest) {
                 { $arrayElemAt: ['$productDoc.productName', 0] },
               ],
             },
+            itemCost: {
+              $reduce: {
+                input: { $ifNull: ['$fifoBreakdown', []] },
+                initialValue: 0,
+                in: {
+                  $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }],
+                },
+              },
+            },
+            adjustedRevenue: {
+              $cond: [
+                { $gt: ['$bill.totalAmount', 0] },
+                {
+                  $multiply: [
+                    '$totalAmount',
+                    { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] },
+                  ],
+                },
+                '$totalAmount',
+              ],
+            },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
             _id: { key: { $ifNull: ['$product', '$indiaProduct'] }, source: '$source' },
             name: { $first: '$productName' },
             unitsSold: { $sum: '$unitsSold' },
-            revenue: { $sum: '$totalAmount' },
-            profit: { $sum: '$totalProfit' },
+            revenue: { $sum: '$adjustedRevenue' },
+            profit: { $sum: '$adjustedProfit' },
           },
         },
         {
@@ -301,7 +342,7 @@ export async function GET(req: NextRequest) {
         },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
-      // Monthly revenue / cost / profit last 6 months
+      // Monthly revenue / cost / profit last 12 months
       SellBillItem.aggregate([
         {
           $lookup: {
@@ -312,7 +353,7 @@ export async function GET(req: NextRequest) {
           },
         },
         { $unwind: '$bill' },
-        { $match: { 'bill.billDate': { $gte: sixMonthsAgo, $lte: monthEnd } } },
+        { $match: { 'bill.billDate': { $gte: twelveMonthsAgo, $lte: monthEnd } } },
         {
           $addFields: {
             itemCost: {
@@ -324,17 +365,30 @@ export async function GET(req: NextRequest) {
                 },
               },
             },
+            adjustedRevenue: {
+              $cond: [
+                { $gt: ['$bill.totalAmount', 0] },
+                {
+                  $multiply: [
+                    '$totalAmount',
+                    { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] },
+                  ],
+                },
+                '$totalAmount',
+              ],
+            },
             month: {
               $dateToString: { format: '%Y-%m', date: '$bill.billDate' },
             },
           },
         },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
         {
           $group: {
             _id: '$month',
-            revenue: { $sum: '$totalAmount' },
-            cost: { $sum: '$itemCost' },
-            profit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            profit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { _id: 1 } },
@@ -342,7 +396,7 @@ export async function GET(req: NextRequest) {
       Expense.aggregate([
         {
           $match: {
-            expenseDate: { $gte: sixMonthsAgo, $lte: monthEnd },
+            expenseDate: { $gte: twelveMonthsAgo, $lte: monthEnd },
           },
         },
         {
@@ -363,14 +417,6 @@ export async function GET(req: NextRequest) {
           },
         },
       ]),
-      PaymentReceipt.aggregate([
-        {
-          $group: {
-            _id: '$company',
-            totalReceived: { $sum: '$amount' },
-          },
-        },
-      ]),
       // Oldest bill per company
       SellBill.aggregate([
         {
@@ -380,72 +426,160 @@ export async function GET(req: NextRequest) {
           },
         },
       ]),
-      // Dead stock (China entries in India warehouse, no sales in 30+ days)
+      // In-stock products (China + India warehouses) with days since their last sale
       (async () => {
-        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-        const salesAgg = await SellBillItem.aggregate([
-          {
-            $lookup: {
-              from: 'sellbills',
-              localField: 'sellBill',
-              foreignField: '_id',
-              as: 'bill',
-            },
-          },
-          { $unwind: '$bill' },
-          { $match: { 'bill.billDate': { $lte: now } } },
-          { $unwind: '$fifoBreakdown' },
-          {
-            $group: {
-              _id: '$fifoBreakdown.buyingEntry',
-              lastSaleDate: { $max: '$bill.billDate' },
-            },
-          },
+        // Most recent sale date per PRODUCT across ALL bills (not just the
+        // currently in-stock batch). A product counts as sold even if the batch
+        // still on hand was never itself sold from. China sales carry `product`
+        // (ref Product); India sales carry `indiaProduct` (ref IndiaProduct).
+        const [chinaSalesAgg, indiaSalesAgg] = await Promise.all([
+          SellBillItem.aggregate([
+            { $match: { productSource: 'china', product: { $ne: null } } },
+            { $lookup: { from: 'sellbills', localField: 'sellBill', foreignField: '_id', as: 'bill' } },
+            { $unwind: '$bill' },
+            { $match: { 'bill.billDate': { $lte: now } } },
+            { $group: { _id: '$product', lastSaleDate: { $max: '$bill.billDate' } } },
+          ]),
+          SellBillItem.aggregate([
+            { $match: { productSource: 'india', indiaProduct: { $ne: null } } },
+            { $lookup: { from: 'sellbills', localField: 'sellBill', foreignField: '_id', as: 'bill' } },
+            { $unwind: '$bill' },
+            { $match: { 'bill.billDate': { $lte: now } } },
+            { $group: { _id: '$indiaProduct', lastSaleDate: { $max: '$bill.billDate' } } },
+          ]),
         ])
-        const lastSaleMap = new Map<string, Date>()
-        for (const s of salesAgg) {
-          if (s._id) lastSaleMap.set(String(s._id), s.lastSaleDate as Date)
+        const chinaLastSaleMap = new Map<string, Date>()
+        for (const s of chinaSalesAgg) {
+          if (s._id) chinaLastSaleMap.set(String(s._id), s.lastSaleDate as Date)
         }
-        const candidates = await BuyingEntry.find({
-          chinaWarehouseReceived: 'yes',
-          availableCtn: { $gt: 0 },
-        })
-          .populate('product', 'productName')
-          .lean()
+        const indiaLastSaleMap = new Map<string, Date>()
+        for (const s of indiaSalesAgg) {
+          if (s._id) indiaLastSaleMap.set(String(s._id), s.lastSaleDate as Date)
+        }
 
-        const dead: {
-          productName: string
-          availableCtn: number
-          inventoryValue: number
-          daysSinceLastSale: number
-        }[] = []
-        for (const entry of candidates as any[]) {
-          const lastSale = lastSaleMap.get(String(entry._id))
-          if (!lastSale || lastSale < thirtyDaysAgo) {
-            const days = lastSale
-              ? Math.floor(
-                  (now.getTime() - lastSale.getTime()) /
-                    (24 * 60 * 60 * 1000)
-                )
-              : 999
-            const rawValue =
-              (entry.availableCtn ?? 0) *
-              (entry.qty ?? 0) *
-              (entry.finalCost ?? 0)
+        const [chinaCandidates, indiaCandidates] = await Promise.all([
+          BuyingEntry.find({ chinaWarehouseReceived: 'yes', availableCtn: { $gt: 0 } })
+            .populate('product', 'productName')
+            .lean(),
+          IndiaBuyingEntry.find({ availableCtn: { $gt: 0 } })
+            .populate('product', 'productName')
+            .lean(),
+        ])
+
+        // Aggregate per product: sum stock/value across batches; last sale is
+        // looked up by product id (below), so it reflects the whole product.
+        const byProduct = new Map<
+          string,
+          {
+            productName: string
+            source: 'China' | 'India'
+            availableCtn: number
+            availablePcs: number
+            inventoryValue: number
+            lastSale: Date | null
+            // Earliest entryDate among the currently in-stock batches — i.e.
+            // when the oldest stock still on hand became available.
+            availableSince: Date | null
+          }
+        >()
+        const collect = (
+          entries: any[],
+          source: 'China' | 'India',
+          saleMap: Map<string, Date>
+        ) => {
+          for (const entry of entries) {
+            const productId = String(
+              (entry.product as { _id?: unknown })?._id ?? entry.product ?? entry._id
+            )
+            const key = `${source}:${productId}`
+            const productName =
+              (entry.product as { productName?: string })?.productName ?? '—'
+            const lastSale = saleMap.get(productId) ?? null
+            // When this batch's stock became available. China stock is finalized
+            // when the entry is LOCKED, so use lockedAt (fall back to entryDate
+            // if an available entry isn't locked yet). India has no lock step, so
+            // its buying entryDate is when the stock is available.
+            const entryDateRaw = (entry.entryDate as Date | undefined)
+              ? new Date(entry.entryDate as Date)
+              : null
+            const lockedAt = (entry.lockedAt as Date | undefined)
+              ? new Date(entry.lockedAt as Date)
+              : null
+            const availableFrom =
+              source === 'China' ? lockedAt ?? entryDateRaw : entryDateRaw
+            // Round PCS to an integer per batch (matches stock report / india
+            // products list), then value = pcs * cost. This snaps away FIFO
+            // float residue like availableCtn = 0.00001 -> 0 pcs -> ₹0.
+            const ctn = entry.availableCtn ?? 0
+            const pcs = Math.round(ctn * (entry.qty ?? 0))
+            const cost = entry.finalCost ?? entry.rate ?? 0
+            const rawValue = pcs * cost
             const value =
               Number.isFinite(rawValue) && !Number.isNaN(rawValue) ? rawValue : 0
-            dead.push({
-              productName:
-                (entry.product as { productName?: string })?.productName ??
-                '—',
-              availableCtn: entry.availableCtn ?? 0,
-              inventoryValue: value,
-              daysSinceLastSale: days,
-            })
+            const existing = byProduct.get(key)
+            if (existing) {
+              existing.availableCtn += ctn
+              existing.availablePcs += pcs
+              existing.inventoryValue += value
+              if (lastSale && (!existing.lastSale || lastSale > existing.lastSale)) {
+                existing.lastSale = lastSale
+              }
+              if (
+                availableFrom &&
+                (!existing.availableSince || availableFrom < existing.availableSince)
+              ) {
+                existing.availableSince = availableFrom
+              }
+            } else {
+              byProduct.set(key, {
+                productName,
+                source,
+                availableCtn: ctn,
+                availablePcs: pcs,
+                inventoryValue: value,
+                lastSale,
+                availableSince: availableFrom,
+              })
+            }
           }
         }
-        dead.sort((a, b) => b.inventoryValue - a.inventoryValue)
-        return dead.slice(0, 10)
+        collect(chinaCandidates as any[], 'China', chinaLastSaleMap)
+        collect(indiaCandidates as any[], 'India', indiaLastSaleMap)
+
+        const dead = Array.from(byProduct.values())
+          // Drop products that are effectively sold out (only FIFO float
+          // residue left, e.g. availableCtn 0.00001 -> 0 pcs).
+          .filter((p) => p.availablePcs > 0)
+          .map((p) => {
+            // How long the CURRENT stock has been sitting unsold: measured from
+            // the later of (last sale, when this stock became available). If the
+            // product sold out and was restocked, the clock restarts at the new
+            // stock's arrival instead of the old sale date.
+            const anchorMs = Math.max(
+              p.lastSale ? p.lastSale.getTime() : 0,
+              p.availableSince ? p.availableSince.getTime() : 0
+            )
+            const daysNotSold = anchorMs
+              ? Math.max(
+                  0,
+                  Math.floor((now.getTime() - anchorMs) / (24 * 60 * 60 * 1000))
+                )
+              : 0
+            return {
+              productName: p.productName,
+              source: p.source,
+              // Snap tiny float residuals to 0, else round to 2 dp (matches
+              // india products list availableCtn display).
+              availableCtn:
+                p.availableCtn < 0.001 ? 0 : Math.round(p.availableCtn * 100) / 100,
+              availablePcs: p.availablePcs,
+              inventoryValue: p.inventoryValue,
+              daysNotSold,
+              neverSold: !p.lastSale,
+            }
+          })
+        dead.sort((a, b) => b.daysNotSold - a.daysNotSold)
+        return dead
       })(),
       SellBill.countDocuments({ whatsappSent: false }),
       BuyingEntry.countDocuments({
@@ -462,8 +596,87 @@ export async function GET(req: NextRequest) {
       }),
     ])
 
+    // Compute online bank IDs so we can fetch their true ledger balances
+    const onlineBankAccounts = (bankAccounts as { _id: mongoose.Types.ObjectId; accountName: string; type: string }[])
+      .filter((a) => a.type !== 'cash')
+    const onlineBankIds = onlineBankAccounts.map((a) => a._id)
+
+    const [liabilityDocs, cashDoc, bankTxAgg, investmentAgg, allTimeGrossProfitAgg, allTimeExpensesAgg] = await Promise.all([
+      Liability.find({}).select('status amount').lean(),
+      // True cash balance lives in the Cash ledger, not BankAccount.currentBalance
+      Cash.findOne().select('balance').lean(),
+      // True bank balances come from BankTransaction ledger (same as banks page)
+      onlineBankIds.length > 0
+        ? BankTransaction.aggregate([
+            { $match: { bankAccount: { $in: onlineBankIds } } },
+            {
+              $group: {
+                _id: '$bankAccount',
+                balance: {
+                  $sum: {
+                    $cond: [{ $eq: ['$type', 'credit'] }, '$amount', { $multiply: ['$amount', -1] }],
+                  },
+                },
+              },
+            },
+          ])
+        : Promise.resolve([]),
+      // Total investment across all investors (banks module)
+      Investment.aggregate([{ $group: { _id: null, total: { $sum: '$currentBalance' } } }]),
+      // All-time gross profit (no date filter) — adjusted for bill-level extra charges and discounts
+      SellBillItem.aggregate([
+        {
+          $lookup: {
+            from: 'sellbills',
+            localField: 'sellBill',
+            foreignField: '_id',
+            as: 'bill',
+          },
+        },
+        { $unwind: '$bill' },
+        {
+          $addFields: {
+            itemCost: {
+              $reduce: {
+                input: { $ifNull: ['$fifoBreakdown', []] },
+                initialValue: 0,
+                in: {
+                  $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }],
+                },
+              },
+            },
+            adjustedRevenue: {
+              $cond: [
+                { $gt: ['$bill.totalAmount', 0] },
+                {
+                  $multiply: [
+                    '$totalAmount',
+                    { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] },
+                  ],
+                },
+                '$totalAmount',
+              ],
+            },
+          },
+        },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
+        { $group: { _id: null, grossProfit: { $sum: '$adjustedProfit' } } },
+      ]),
+      // All-time total expenses
+      Expense.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
+    ])
+
+    const totalLiabilities = liabilityDocs
+      .filter((l) => l.status === 'blocked')
+      .reduce((s, l) => s + (l.amount ?? 0), 0)
+
+    const totalInvestment = (investmentAgg as { total: number }[])[0]?.total ?? 0
+    const allTimeGrossProfit = (allTimeGrossProfitAgg as { grossProfit: number }[])[0]?.grossProfit ?? 0
+    const allTimeExpenses = (allTimeExpensesAgg as { total: number }[])[0]?.total ?? 0
+    const allTimeNetProfit = allTimeGrossProfit - allTimeExpenses
+
     const chinaBankBalance = chinaBankLastTx?.balanceAfter ?? 0
-    const cashBalance = cashAccount?.currentBalance ?? 0
+    const cashBalance = (cashDoc as { balance?: number } | null)?.balance ?? 0
     // receivedAgg is now per-company; sum up for global total
     const totalReceived = (receivedAgg as { _id: unknown; totalReceived: number }[]).reduce(
       (sum, r) => sum + (r.totalReceived ?? 0),
@@ -480,10 +693,20 @@ export async function GET(req: NextRequest) {
       indiaProducts: indiaInventory,
     }
 
+    const readyToLockArr = readyToLockEntries as unknown as { _id: mongoose.Types.ObjectId; product: { _id: mongoose.Types.ObjectId; productName: string } | null; mark: string }[]
+    const uniqueReadyProducts = Array.from(
+      new Map(
+        readyToLockArr
+          .filter((e) => e.product != null)
+          .map((e) => [String(e.product!._id), { productId: String(e.product!._id), productName: e.product!.productName }])
+      ).values()
+    )
+
     const chinaBankHealth = {
       balance: chinaBankBalance,
       lockedThisMonth: chinaBankDebitsThisMonth[0]?.total ?? 0,
-      readyToLock: readyToLockCount ?? 0,
+      readyToLock: readyToLockArr.length,
+      readyToLockProducts: uniqueReadyProducts,
     }
 
     const stockMovement = {
@@ -517,14 +740,16 @@ export async function GET(req: NextRequest) {
       isDefault: Boolean(p.isDefault),
     }))
 
-    const bankBalances = (bankAccounts as {
-      accountName: string
-      currentBalance?: number
-      type: string
-      _id: mongoose.Types.ObjectId
-    }[]).map((a) => ({
+    const bankTxBalanceMap = new Map(
+      (bankTxAgg as { _id: mongoose.Types.ObjectId; balance: number }[]).map((b) => [
+        String(b._id),
+        parseFloat((b.balance ?? 0).toFixed(2)),
+      ])
+    )
+
+    const bankBalances = onlineBankAccounts.map((a) => ({
       accountName: a.accountName,
-      balance: a.currentBalance ?? 0,
+      balance: bankTxBalanceMap.get(String(a._id)) ?? 0,
       type: a.type,
       id: String(a._id),
     }))
@@ -539,15 +764,19 @@ export async function GET(req: NextRequest) {
     }
 
     const expensesByMonth = new Map<string, number>()
-    for (const e of expensesThisMonth as { _id: string; expenses: number }[]) {
+    for (const e of monthlyExpensesAgg as { _id: string; expenses: number }[]) {
       expensesByMonth.set(e._id, e.expenses)
     }
-    const monthlyComparison = (monthlyRevenueAgg as {
-      _id: string
-      revenue: number
-      cost: number
-      profit: number
-    }[]).map((m) => {
+    const revenueByMonth = new Map(
+      (monthlyRevenueAgg as { _id: string; revenue: number; cost: number; profit: number }[]).map((m) => [m._id, m])
+    )
+    // Every month of the window, oldest first — months with no sales still show (with their expenses)
+    const monthKeys = Array.from({ length: 12 }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - 11 + i, 1)
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    })
+    const monthlyComparison = monthKeys.map((key) => {
+      const m = revenueByMonth.get(key) ?? { _id: key, revenue: 0, cost: 0, profit: 0 }
       const expenses = expensesByMonth.get(m._id) ?? 0
       const netProfit = (m.profit ?? 0) - expenses
       const margin =
@@ -612,7 +841,7 @@ export async function GET(req: NextRequest) {
 
     // Collect all company IDs from both billed and opening balance maps
     // Skip 'null' key — cashbook bills (company = null) have no receivable outstanding
-    const allCompanyIds = new Set([...billedMap.keys(), ...openingBalanceMap.keys()])
+    const allCompanyIds = new Set([...Array.from(billedMap.keys()), ...Array.from(openingBalanceMap.keys())])
     allCompanyIds.forEach((companyId) => {
       if (!companyId || companyId === 'null') return
       const billed = billedMap.get(companyId) ?? 0
@@ -659,9 +888,12 @@ export async function GET(req: NextRequest) {
 
     const deadStock = deadStockAgg as {
       productName: string
+      source: 'China' | 'India'
       availableCtn: number
+      availablePcs: number
       inventoryValue: number
-      daysSinceLastSale: number
+      daysNotSold: number
+      neverSold: boolean
     }[]
 
     return NextResponse.json({
@@ -683,6 +915,10 @@ export async function GET(req: NextRequest) {
         monthlyComparison,
         outstandingAging,
         deadStock,
+        totalLiabilities,
+        totalInvestment,
+        allTimeNetProfit,
+        localConst: Number(process.env.LOCAL_CONST ?? 0),
         unsentWhatsappBills: unsentWhatsappCount ?? 0,
         unlockedReadyEntries: unlockedReadyEntriesCount ?? 0,
         containers: {

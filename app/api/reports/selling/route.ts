@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
-import SellBill from '@/models/SellBill'
-import SellBillItem from '@/models/SellBillItem'
+import { reportModels } from '@/lib/year-reset/archive'
 import { getReportDateRange } from '@/lib/report-utils'
+import { countedIn, loadRevenueExclusion } from '@/lib/revenue-exclusion'
 
 export const dynamic = 'force-dynamic'
 
@@ -23,10 +23,21 @@ export async function GET(req: NextRequest) {
 
     const { start, end } = getReportDateRange(period, startDate, endDate)
     await connectDB()
+    // No archive parameter means the live database, exactly as before.
+    const { SellBill, SellBillItem, Company } = reportModels(searchParams.get('archive'))
+    // Companies flagged "Exclude from revenue": out of Revenue (and bill count / average), profit still counts
+    const exclusion = await loadRevenueExclusion(Company, searchParams)
+    const excludedIds = exclusion.ids
 
     const summaryAgg = await SellBill.aggregate([
       { $match: { billDate: { $gte: start, $lte: end } } },
-      { $group: { _id: null, totalBills: { $sum: 1 }, totalRevenue: { $sum: '$totalAmount' } } },
+      {
+        $group: {
+          _id: null,
+          totalBills: { $sum: countedIn(1, excludedIds, '$company') },
+          totalRevenue: { $sum: countedIn({ $ifNull: ['$grandTotal', '$totalAmount'] }, excludedIds, '$company') },
+        },
+      },
     ])
     const summary = summaryAgg[0] ?? { totalBills: 0, totalRevenue: 0 }
 
@@ -36,7 +47,26 @@ export async function GET(req: NextRequest) {
       { $match: { 'bill.billDate': { $gte: start, $lte: end } } },
       { $lookup: { from: 'products', localField: 'product', foreignField: '_id', as: 'productDoc' } },
       { $unwind: { path: '$productDoc', preserveNullAndEmptyArrays: true } },
-      { $group: { _id: '$product', productName: { $first: '$productDoc.productName' }, revenue: { $sum: '$totalAmount' }, profit: { $sum: '$totalProfit' } } },
+      {
+        $addFields: {
+          itemCost: {
+            $reduce: {
+              input: { $ifNull: ['$fifoBreakdown', []] },
+              initialValue: 0,
+              in: { $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }] },
+            },
+          },
+          adjustedRevenue: {
+            $cond: [
+              { $gt: ['$bill.totalAmount', 0] },
+              { $multiply: ['$totalAmount', { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] }] },
+              '$totalAmount',
+            ],
+          },
+        },
+      },
+      { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
+      { $group: { _id: '$product', productName: { $first: '$productDoc.productName' }, revenue: { $sum: '$adjustedRevenue' }, profit: { $sum: '$adjustedProfit' } } },
       { $sort: { revenue: -1 } },
       { $limit: 5 },
     ])
@@ -47,7 +77,48 @@ export async function GET(req: NextRequest) {
       { $match: { 'bill.billDate': { $gte: start, $lte: end } } },
       { $lookup: { from: 'companies', localField: 'bill.company', foreignField: '_id', as: 'companyDoc' } },
       { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
-      { $group: { _id: '$bill.company', companyName: { $first: '$companyDoc.companyName' }, revenue: { $sum: '$totalAmount' }, profit: { $sum: '$totalProfit' } } },
+      {
+        $addFields: {
+          itemCost: {
+            $reduce: {
+              input: { $ifNull: ['$fifoBreakdown', []] },
+              initialValue: 0,
+              in: { $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }] },
+            },
+          },
+          adjustedRevenue: {
+            $cond: [
+              { $gt: ['$bill.totalAmount', 0] },
+              { $multiply: ['$totalAmount', { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] }] },
+              '$totalAmount',
+            ],
+          },
+        },
+      },
+      { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
+      {
+        $group: {
+          // Normalize missing vs explicit-null so bills predating the
+          // bankAccount field don't split into a separate group (dup rows).
+          _id: {
+            company: { $ifNull: ['$bill.company', null] },
+            bankAccount: { $ifNull: ['$bill.bankAccount', null] },
+          },
+          companyName: {
+            $first: {
+              $cond: [
+                '$bill.company',
+                '$companyDoc.companyName',
+                { $ifNull: ['$bill.companyName', '—'] },
+              ],
+            },
+          },
+          isCashbook: { $first: { $ifNull: ['$bill.isCashbook', false] } },
+          isBankSale: { $first: { $ifNull: ['$bill.isBankSale', false] } },
+          revenue: { $sum: '$adjustedRevenue' },
+          profit: { $sum: '$adjustedProfit' },
+        },
+      },
       { $sort: { revenue: -1 } },
       { $limit: 5 },
     ])
@@ -57,9 +128,36 @@ export async function GET(req: NextRequest) {
       { $lookup: { from: 'companies', localField: 'company', foreignField: '_id', as: 'companyDoc' } },
       { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
       { $lookup: { from: 'sellbillitems', localField: '_id', foreignField: 'sellBill', as: 'items' } },
-      { $addFields: { itemCount: { $size: '$items' }, totalProfit: { $sum: '$items.totalProfit' } } },
+      {
+        $addFields: {
+          itemCount: { $size: '$items' },
+          totalProfit: {
+            $cond: [
+              { $gt: ['$totalAmount', 0] },
+              {
+                $multiply: [
+                  { $sum: '$items.totalProfit' },
+                  { $divide: [{ $ifNull: ['$grandTotal', '$totalAmount'] }, '$totalAmount'] },
+                ],
+              },
+              { $sum: '$items.totalProfit' },
+            ],
+          },
+        },
+      },
       { $sort: { billDate: -1, createdAt: -1 } },
-      { $project: { billNumber: 1, billDate: 1, companyName: '$companyDoc.companyName', totalAmount: 1, itemCount: 1, totalProfit: 1 } },
+      {
+        $project: {
+          billNumber: 1, billDate: 1, totalAmount: { $ifNull: ['$grandTotal', '$totalAmount'] }, itemCount: 1, totalProfit: 1,
+          companyName: {
+            $cond: [
+              '$company',
+              '$companyDoc.companyName',
+              { $ifNull: ['$companyName', '—'] },
+            ],
+          },
+        },
+      },
     ])
 
     const totalBills = summary.totalBills ?? 0
@@ -85,6 +183,7 @@ export async function GET(req: NextRequest) {
         topCompanies,
         bills,
         dateRange: { start, end },
+        revenueExclusion: { companies: exclusion.companies, included: exclusion.included },
       },
     })
   } catch (error) {

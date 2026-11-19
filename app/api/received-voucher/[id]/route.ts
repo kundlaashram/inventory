@@ -7,8 +7,10 @@ import BankTransaction from '@/models/BankTransaction'
 import PaymentReceipt from '@/models/PaymentReceipt'
 import IndiaBuyingPayment from '@/models/IndiaBuyingPayment'
 import { createCashTransaction } from '@/lib/cash-transaction-helper'
+import { recalculateBankAccountLedger } from '@/lib/bank-ledger'
 import { recalcIndiaBuyingEntryGivenAndStatus } from '@/lib/india-buying-entry-payments'
 import mongoose from 'mongoose'
+import { ensureCanDelete, ensureNotViewer } from '@/lib/permissions'
 
 export const dynamic = 'force-dynamic'
 
@@ -65,20 +67,6 @@ export async function GET(
   }
 }
 
-async function recomputeBankAccountBalance(bankAccountId: mongoose.Types.ObjectId): Promise<void> {
-  const txs = await BankTransaction.find({ bankAccount: bankAccountId })
-    .sort({ transactionDate: 1, createdAt: 1 })
-    .lean()
-
-  let balance = 0
-  for (const tx of txs) {
-    balance += tx.type === 'credit' ? tx.amount : -tx.amount
-    await BankTransaction.updateOne({ _id: tx._id }, { $set: { balanceAfter: balance } })
-  }
-
-  await BankAccount.findByIdAndUpdate(bankAccountId, { currentBalance: balance })
-}
-
 export async function PUT(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -91,6 +79,14 @@ export async function PUT(
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -114,9 +110,9 @@ export async function PUT(
         { status: 400 }
       )
     }
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || amount === 0) {
       return NextResponse.json(
-        { success: false, error: 'Validation failed', message: 'Amount must be a positive number' },
+        { success: false, error: 'Validation failed', message: 'Amount must be a non-zero number' },
         { status: 400 }
       )
     }
@@ -163,14 +159,17 @@ export async function PUT(
     }
 
     const originalWasCash = (payment as { paymentMode?: string }).paymentMode === 'cash'
+    const originalAmount = (payment as { amount: number }).amount
     const originalTx = await BankTransaction.findOne({ source: 'payment_receipt', sourceRef: payment._id })
       .sort({ transactionDate: -1, createdAt: -1 })
       .lean()
 
     if (originalWasCash) {
+      // Reverse the original: if it was a credit (positive), reverse with debit; if debit (negative), reverse with credit
+      const reversalType = originalAmount > 0 ? 'debit' : 'credit'
       await createCashTransaction({
-        type: 'debit',
-        amount: (payment as { amount: number }).amount,
+        type: reversalType,
+        amount: Math.abs(originalAmount),
         description: `Reversal of payment from ${(company as { companyName?: string }).companyName}`,
         date: new Date(new Date().setHours(0, 0, 0, 0)),
         category: 'reversal',
@@ -181,9 +180,10 @@ export async function PUT(
       })
     } else if (originalTx) {
       const originalDate = (originalTx as { transactionDate?: Date }).transactionDate
+      const reversalType = (originalTx as { type: string }).type === 'credit' ? 'debit' : 'credit'
       await BankTransaction.create({
         bankAccount: originalTx.bankAccount,
-        type: 'debit',
+        type: reversalType,
         amount: originalTx.amount,
         balanceAfter: 0,
         source: 'payment_receipt',
@@ -194,7 +194,7 @@ export async function PUT(
         createdBy: updatedBy,
         sortOrder: 1,
       })
-      await recomputeBankAccountBalance(originalTx.bankAccount as mongoose.Types.ObjectId)
+      await recalculateBankAccountLedger(originalTx.bankAccount as mongoose.Types.ObjectId)
     }
 
     // Resolve new bank account for updated payment
@@ -236,36 +236,39 @@ export async function PUT(
     payment.updatedBy = updatedBy
     await payment.save()
 
+    const txType = amount > 0 ? 'credit' : 'debit'
+    const absAmount = Math.abs(amount)
+    const companyName = (company as { companyName?: string }).companyName
+    const txDescription = amount > 0
+      ? `Payment received from ${companyName}`
+      : `Payment made to ${companyName}`
+
     if (paymentMode === 'cash') {
       await createCashTransaction({
-        type: 'credit',
-        amount,
-        description: `Payment received from ${(company as { companyName?: string }).companyName}`,
+        type: txType,
+        amount: absAmount,
+        description: txDescription,
         date: paymentDate,
         category: 'payment_received',
         referenceId: payment._id as mongoose.Types.ObjectId,
         referenceType: 'PaymentReceipt',
       })
     } else {
-      const lastTx = await BankTransaction.findOne({ bankAccount: bankAccount!._id })
-        .sort({ transactionDate: -1, createdAt: -1 })
-        .select('balanceAfter')
-        .lean()
-      const lastBalance = lastTx?.balanceAfter ?? 0
-      const newBalance = lastBalance + amount
+      // balanceAfter is a placeholder — recalculateBankAccountLedger (true
+      // createdAt order) fixes it below.
       await BankTransaction.create({
         bankAccount: bankAccount!._id,
-        type: 'credit',
-        amount,
-        balanceAfter: newBalance,
+        type: txType,
+        amount: absAmount,
+        balanceAfter: 0,
         source: 'payment_receipt',
         sourceRef: payment._id,
-        sourceLabel: `Payment received from ${(company as { companyName?: string }).companyName}`,
+        sourceLabel: txDescription,
         transactionDate: paymentDate,
         notes: remark,
         createdBy: updatedBy,
       })
-      await recomputeBankAccountBalance(bankAccount!._id)
+      await recalculateBankAccountLedger(bankAccount!._id, { updatedBy })
     }
 
     return NextResponse.json({ success: true, data: { _id: payment._id } })
@@ -294,6 +297,14 @@ export async function DELETE(
         { status: 401 }
       )
     }
+    const perm = ensureCanDelete(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -322,9 +333,11 @@ export async function DELETE(
         await recalcIndiaBuyingEntryGivenAndStatus(buyingEntryId)
       }
     } else if (paymentMode === 'cash') {
+      const deletedAmount = (payment as { amount: number }).amount
+      const reversalType = deletedAmount > 0 ? 'debit' : 'credit'
       await createCashTransaction({
-        type: 'debit',
-        amount: (payment as { amount: number }).amount,
+        type: reversalType,
+        amount: Math.abs(deletedAmount),
         description: 'Reversal of deleted payment',
         date: new Date(new Date().setHours(0, 0, 0, 0)),
         category: 'reversal',
@@ -339,9 +352,10 @@ export async function DELETE(
         .lean()
       if (tx) {
         const originalDate = (tx as { transactionDate?: Date }).transactionDate
+        const reversalType = (tx as { type: string }).type === 'credit' ? 'debit' : 'credit'
         await BankTransaction.create({
           bankAccount: tx.bankAccount,
-          type: 'debit',
+          type: reversalType,
           amount: tx.amount,
           balanceAfter: 0,
           source: 'payment_receipt',
@@ -352,7 +366,7 @@ export async function DELETE(
           createdBy: tx.createdBy,
           sortOrder: 1,
         })
-        await recomputeBankAccountBalance(tx.bankAccount as mongoose.Types.ObjectId)
+        await recalculateBankAccountLedger(tx.bankAccount as mongoose.Types.ObjectId)
       }
     }
 

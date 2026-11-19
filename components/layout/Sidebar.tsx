@@ -4,6 +4,7 @@ import { useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
+  CalendarClock,
   LayoutDashboard,
   Landmark,
   Package,
@@ -28,24 +29,25 @@ type NavItem = {
   href: string
   label: string
   icon: typeof LayoutDashboard
-  roles?: readonly ['owner', 'admin']
+  roles?: readonly ('owner' | 'admin')[]
 }
 
 const navItems: NavItem[] = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/china-bank', label: 'China Bank', icon: Landmark },
   { href: '/products', label: 'Products', icon: Package },
-  { href: '/containers', label: 'Containers', icon: Ship },
+  // { href: '/containers', label: 'Containers', icon: Ship }, // hidden for now
   { href: '/companies', label: 'Companies', icon: Building2 },
   { href: '/sale-bills', label: 'Sale Bills', icon: FileText },
   { href: '/carrying', label: 'Carrying', icon: Truck },
   { href: '/received-voucher', label: 'Receive Voucher', icon: Wallet },
+  { href: '/china-bank', label: 'China Bank', icon: Landmark },
   { href: '/banks', label: 'Our Banks', icon: Banknote },
   { href: '/reports', label: 'Reports', icon: BarChart3 },
   { href: '/expenses', label: 'Expenses', icon: Receipt },
   { href: '/sophia', label: 'Sophia', icon: Flag },
   { href: '/liabilities', label: 'Liabilities', icon: ShieldAlert },
   { href: '/users', label: 'Users', icon: Users, roles: ['owner', 'admin'] },
+  { href: '/year-end-reset', label: 'Year-End Reset', icon: CalendarClock, roles: ['owner'] },
 ]
 
 type DotState = 'idle' | 'running' | 'success' | 'error'

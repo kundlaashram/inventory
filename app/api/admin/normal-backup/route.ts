@@ -1,23 +1,15 @@
 import { MongoClient } from 'mongodb'
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuth } from '@/lib/auth'
+import { resolveAtlasUri } from '@/lib/resolve-atlas-uri'
 
 export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
   const { user, error } = await requireAuth(req, ['owner'])
 
-  if (!user || error === 'Unauthorized') {
-    return NextResponse.json(
-      {
-        success: false,
-        error: 'Unauthorized',
-        message: 'Invalid or expired token',
-      },
-      { status: 401 }
-    )
-  }
-
+  // requireAuth returns user:null for both failures, so Forbidden has to be
+  // checked first or a signed-in non-owner is reported as unauthenticated.
   if (error === 'Forbidden') {
     return NextResponse.json(
       {
@@ -26,6 +18,17 @@ export async function POST(req: NextRequest) {
         message: 'You do not have permission to perform this action',
       },
       { status: 403 }
+    )
+  }
+
+  if (!user) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Unauthorized',
+        message: 'Invalid or expired token',
+      },
+      { status: 401 }
     )
   }
 
@@ -48,8 +51,10 @@ export async function POST(req: NextRequest) {
   let atlasClient: MongoClient | null = null
 
   try {
+    const directAtlasUri = await resolveAtlasUri(atlasUri)
+
     localClient = new MongoClient(localUri)
-    atlasClient = new MongoClient(atlasUri)
+    atlasClient = new MongoClient(directAtlasUri)
 
     await localClient.connect()
     await atlasClient.connect()

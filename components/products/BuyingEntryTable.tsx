@@ -30,6 +30,7 @@ export interface BuyingEntryRow {
   qty: number
   rate: number
   cbm: number
+  cbmBreakdown?: { ctn: number; cbm: number; carryingRate?: number; rmbRate?: number }[]
   weight: number
   givenAmount: number
   hasAdvancePayment?: boolean
@@ -74,6 +75,7 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
   const [loading, setLoading] = useState(true)
   const [entries, setEntries] = useState<BuyingEntryRow[]>([])
   const [pagination, setPagination] = useState({ page: 1, pages: 1, total: 0 })
+  const [currentPage, setCurrentPage] = useState(1)
   const [expandedEntryId, setExpandedEntryId] = useState<string | null>(null)
   const [paymentsByEntry, setPaymentsByEntry] = useState<Record<string, { _id: string; amount: number; paymentDate: string; chinaPersonName?: string; notes?: string }[]>>({})
   const [paymentsLoading, setPaymentsLoading] = useState<string | null>(null)
@@ -97,18 +99,6 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
           (entry.soldCtn ?? 0)
       ).toFixed(2)
     )
-  }
-
-  function stockBadge(entry: BuyingEntryRow) {
-    const available = calculatedAvailableCtn(entry)
-    const soldCtn = entry.soldCtn ?? 0
-    if (soldCtn === 0) {
-      return <Badge variant="outline" className="border-green-600 text-green-700 bg-green-50 dark:bg-green-950 dark:text-green-300 dark:border-green-700">Available</Badge>
-    }
-    if (available === 0) {
-      return <Badge variant="outline" className="border-red-600 text-red-700 bg-red-50 dark:bg-red-950 dark:text-red-300 dark:border-red-700">Fully Sold</Badge>
-    }
-    return <Badge variant="outline" className="border-amber-600 text-amber-700 bg-amber-50 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-700">Partially Sold</Badge>
   }
 
   function availableCtnClass(entry: BuyingEntryRow) {
@@ -153,17 +143,17 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
     )
   }, [filteredEntries])
 
-  const fetchEntries = useCallback(async () => {
+  const fetchEntries = useCallback(async (page = currentPage) => {
     setLoading(true)
     const result = await apiGet<{ entries: BuyingEntryRow[]; pagination: { page: number; pages: number; total: number } }>(
-      `/api/buying-entries?productId=${productId}&limit=20`
+      `/api/buying-entries?productId=${productId}&limit=20&page=${page}`
     )
     setLoading(false)
     if (result.success) {
       setEntries(result.data.entries)
       setPagination(result.data.pagination)
     } else toast.error(result.message)
-  }, [productId])
+  }, [productId, currentPage])
 
   useEffect(() => {
     fetchEntries()
@@ -174,7 +164,11 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
     if (result.success) {
       toast.success('Entry deleted')
       setDeleteConfirm(null)
-      fetchEntries()
+      if (currentPage === 1) {
+        fetchEntries()
+      } else {
+        setCurrentPage(1)
+      }
       onRefresh()
     } else toast.error(result.message ?? result.error)
   }
@@ -284,9 +278,18 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
               </tr>
             </thead>
                 <tbody>
-              {filteredEntries.map((entry) => (
+              {filteredEntries.map((entry) => {
+                const availCtn = calculatedAvailableCtn(entry)
+                return (
                 <React.Fragment key={entry._id}>
-                  <tr className="border-b hover:bg-muted/50">
+                  <tr className={cn(
+                    "border-b",
+                    (entry.soldCtn ?? 0) >= entry.totalCtn && entry.totalCtn > 0
+                      ? "bg-red-50 hover:bg-red-100 dark:bg-red-950/20 dark:hover:bg-red-950/30"
+                      : availCtn > 0 && entry.chinaWarehouseReceived === 'yes'
+                        ? "bg-green-50 hover:bg-green-100 dark:bg-green-950/20 dark:hover:bg-green-950/30"
+                        : "hover:bg-muted/50"
+                  )}>
                     <td className="p-1">
                       <Button
                         variant="ghost"
@@ -395,6 +398,9 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                           totalExpenseINR={entry.totalExpenseINR}
                           qty={entry.qty}
                           finalCost={entry.finalCost}
+                          rate={entry.rate}
+                          cbm={entry.cbm}
+                          cbmBreakdown={entry.cbmBreakdown}
                           onSuccess={fetchEntries}
                         />
                       </div>
@@ -476,13 +482,13 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                                 </div>
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Rate per piece</span>
-                                  <span className="font-semibold">¥{new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(entry.rate)}</span>
+                                  <span className="font-semibold">¥{new Intl.NumberFormat('en-IN', { maximumFractionDigits: 5 }).format(entry.rate)}</span>
                                 </div>
 
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Total Amount (RMB)</span>
                                   <span className="font-semibold">
-                                    <AmountDisplay amount={entry.totalAmount} currency="RMB" />
+                                    <AmountDisplay amount={entry.totalAmount} currency="RMB" decimals={5} />
                                   </span>
                                 </div>
                                 <div className="flex flex-col">
@@ -494,7 +500,7 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">RMB → INR Value</span>
                                   <span className="font-semibold">
-                                    <AmountDisplay amount={entry.rmbInrPurchase} />
+                                    <AmountDisplay amount={entry.rmbInrPurchase} decimals={5} />
                                   </span>
                                 </div>
                                 <div className="flex flex-col">
@@ -507,19 +513,19 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Total Carrying (₹)</span>
                                   <span className="font-semibold">
-                                    <AmountDisplay amount={entry.totalCarrying} />
+                                    <AmountDisplay amount={entry.totalCarrying} decimals={5} />
                                   </span>
                                 </div>
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Shipping Cost per piece</span>
                                   <span className="font-semibold text-orange-600">
-                                    ₹{(entry.totalQty > 0 ? entry.totalCarrying / entry.totalQty : 0).toFixed(2)}
+                                    ₹{(entry.totalQty > 0 ? entry.totalCarrying / entry.totalQty : 0).toFixed(5)}
                                   </span>
                                 </div>
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Total Expense INR</span>
                                   <span className="font-semibold text-blue-600">
-                                    <AmountDisplay amount={entry.totalExpenseINR} />
+                                    <AmountDisplay amount={entry.totalExpenseINR} decimals={5} />
                                   </span>
                                 </div>
                                 <div className="flex flex-col">
@@ -536,8 +542,25 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                                 </div>
 
                                 <div className="flex flex-col">
-                                  <span className="text-xs text-muted-foreground">CBM per CTN</span>
+                                  <span className="text-xs text-muted-foreground">
+                                    CBM per CTN{entry.cbmBreakdown?.length ? ' (avg)' : ''}
+                                  </span>
                                   <span className="font-semibold">{entry.cbm}</span>
+                                  {entry.cbmBreakdown?.length ? (
+                                    <span className="text-xs text-muted-foreground">
+                                      {entry.cbmBreakdown
+                                        .map((r) =>
+                                          [
+                                            `${r.ctn} × ${r.cbm}`,
+                                            r.carryingRate != null ? `₹${r.carryingRate}/CBM` : null,
+                                            r.rmbRate != null ? `RMB ${r.rmbRate}` : null,
+                                          ]
+                                            .filter(Boolean)
+                                            .join(' @ ')
+                                        )
+                                        .join(' + ')}
+                                    </span>
+                                  ) : null}
                                 </div>
                                 <div className="flex flex-col">
                                   <span className="text-xs text-muted-foreground">Total CBM</span>
@@ -782,7 +805,8 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
                     </tr>
                   )}
                 </React.Fragment>
-              ))}
+              )})}
+
             </tbody>
            
           </table>
@@ -794,6 +818,24 @@ export function BuyingEntryTable({ productId, onRefresh, onEdit, onAdd, onMakePa
           <p className="text-sm text-muted-foreground">
             Page {pagination.page} of {pagination.pages} ({pagination.total} total)
           </p>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage <= 1 || loading}
+              onClick={() => setCurrentPage((p) => p - 1)}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage >= pagination.pages || loading}
+              onClick={() => setCurrentPage((p) => p + 1)}
+            >
+              Next
+            </Button>
+          </div>
         </div>
       )}
     </div>

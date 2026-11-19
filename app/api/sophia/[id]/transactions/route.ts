@@ -53,6 +53,8 @@ export async function GET(
     const startDate = searchParams.get('startDate')?.trim()
     const endDate = searchParams.get('endDate')?.trim()
     const exportAll = searchParams.get('exportAll') === '1'
+    const txTypeParam = searchParams.get('type')?.trim()
+    const txType = txTypeParam === 'pay_in' || txTypeParam === 'pay_out' ? txTypeParam : null
 
     await connectDB()
 
@@ -81,20 +83,13 @@ export async function GET(
       .sort({ transactionDate: 1, sortOrder: 1, createdAt: 1, _id: 1 })
       .lean()) as LeanTx[]
 
-    const totalFiltered = timelineAsc.length
-
-    // Build a deterministic balanceAfter chain using the earliest transaction's stored balanceAfter as anchor.
-    // That keeps the response consistent for the UI even if older records were created out-of-order.
-    let runningBalance = 0
-    if (timelineAsc.length > 0) {
-      const first = timelineAsc[0]
-      const firstDelta = first.type === 'pay_in' ? first.amount : -first.amount
-      const firstBalanceAfter = first.balanceAfter ?? 0
-      // balanceAfter = balanceBefore + firstDelta => balanceBefore = balanceAfter - delta
-      runningBalance = firstBalanceAfter - firstDelta
-    } else {
-      runningBalance = person.currentBalance ?? 0
-    }
+    // Use currentBalance as the authoritative anchor. Subtracting the net of all
+    // transactions in this view gives the balance just before the earliest shown tx,
+    // keeping every row's balanceAfter consistent with the stored currentBalance.
+    const sumDelta = timelineAsc.reduce((acc, t) => {
+      return acc + (t.type === 'pay_in' ? t.amount : -t.amount)
+    }, 0)
+    let runningBalance = (person.currentBalance ?? 0) - sumDelta
 
     const computedAsc = timelineAsc.map((t) => {
       const delta = t.type === 'pay_in' ? t.amount : -t.amount
@@ -111,7 +106,11 @@ export async function GET(
       }
     })
 
-    const computedDesc = computedAsc.slice().reverse()
+    // Filter by type AFTER computing balances so balanceAfter stays accurate
+    const typeFiltered = txType ? computedAsc.filter((t) => t.type === txType) : computedAsc
+    const totalFiltered = typeFiltered.length
+
+    const computedDesc = typeFiltered.slice().reverse()
     const selected = exportAll
       ? computedDesc
       : computedDesc.slice((page - 1) * limit, page * limit)

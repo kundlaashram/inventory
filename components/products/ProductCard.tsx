@@ -26,10 +26,16 @@ interface ProductCardProps {
   totalWeight?: number
     /** Sum of remainingAmount (¥ RMB) across unpaid/partially paid entries */
   remainingAmount?: number
-  /** Sum of availableValue (₹ INR) across entries for India products */
+  /** ₹ INR value of available (unsold) stock, summed across entries */
   availableValue?: number
   /** Total available pcs across entries (India products) */
   availablePcs?: number
+  /** Sum of totalAmount (¥ RMB) across locked entries */
+  lockedAmountRMB?: number
+  /** Sum of lockedAmount (₹) — finalCost × qty × lockedCtn, stored at lock time */
+  lockedAmountINR?: number
+  /** Weighted avg final cost per pcs (₹) across entries that still have stock */
+  avgFinalCostPerPcs?: number
 }
 
 export function ProductCard({
@@ -53,8 +59,16 @@ export function ProductCard({
   remainingAmount,
   availableValue,
   availablePcs,
+  lockedAmountRMB,
+  lockedAmountINR,
+  avgFinalCostPerPcs,
 }: ProductCardProps) {
   const href = detailHref ?? `/products/${_id}`
+  // Avg available pieces per available carton — only meaningful when stock remains
+  const avgPcsPerCtn =
+    availablePcs != null && availablePcs > 0 && availableCtn > 0
+      ? availablePcs / availableCtn
+      : null
   return (
     <Link href={href}>
       <Card className="transition-shadow hover:shadow-md">
@@ -84,10 +98,6 @@ export function ProductCard({
         <CardContent className="p-4 pt-1">
           <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
             <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Total CTN</span>
-              <span className="font-semibold">{totalCtn} CTN</span>
-            </div>
-            <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Available</span>
               <span
                 className={`font-semibold ${
@@ -106,14 +116,6 @@ export function ProductCard({
                   }`}
                 >
                   {availablePcs.toLocaleString('en-IN')} PCS
-                </span>
-              </div>
-            )}
-            {availableValue != null && availableValue > 0 && (
-              <div className="flex items-center justify-between col-span-2 py-1 border-y border-emerald-100 bg-emerald-50/30 -mx-1 px-1 dark:bg-emerald-950/10 dark:border-emerald-900/20">
-                <span className="text-emerald-600 font-medium">Available Value</span>
-                <span className="font-bold text-emerald-700 dark:text-emerald-400">
-                  ₹{availableValue.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
               </div>
             )}
@@ -164,7 +166,7 @@ export function ProductCard({
               </div>
             )}
             {totalCbm != null && (
-              <div className="flex items-center justify-between col-span-2">
+              <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">📦 Total CBM</span>
                 <span className="font-semibold">
                   {(totalCbm ?? 0).toLocaleString('en-IN', {
@@ -174,18 +176,58 @@ export function ProductCard({
               </div>
             )}
             {totalWeight != null && (
-              <div className="flex items-center justify-between col-span-2">
+              <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">⚖️ Total Weight</span>
                 <span className="font-semibold">
                   {(totalWeight ?? 0).toFixed(2)} kg
                 </span>
               </div>
             )}
+            {lockedAmountRMB != null && lockedAmountRMB > 0 && (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">🔒 Locked (¥)</span>
+                <span className="font-semibold text-blue-600 dark:text-blue-400">
+                  ¥{lockedAmountRMB.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            )}
+            {lockedAmountINR != null && lockedAmountINR > 0 && (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">🔒 Locked (₹)</span>
+                <span className="font-semibold text-blue-600 dark:text-blue-400">
+                  ₹{lockedAmountINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            )}
+            {availableValue != null && availableValue > 0 && (
+              <div className="flex items-center justify-between">
+                <span className="text-emerald-600 font-medium">A Value</span>
+                <span className="font-bold text-emerald-700 dark:text-emerald-400">
+                  ₹{availableValue.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+            )}
+            {avgFinalCostPerPcs != null && avgFinalCostPerPcs > 0 && (
+              <div className="flex items-center justify-between">
+                <span className="text-emerald-600 font-medium">Cost / PCS</span>
+                <span className="font-bold text-emerald-700 dark:text-emerald-400">
+                  ₹{avgFinalCostPerPcs.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+            )}
             {remainingAmount != null && remainingAmount > 0 && (
-              <div className="flex items-center justify-between col-span-2">
+              <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Remaining to pay</span>
                 <span className="font-semibold text-amber-600 dark:text-amber-400">
                   ¥{(remainingAmount ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            )}
+            {avgPcsPerCtn != null && (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Avg PCS / CTN</span>
+                <span className="font-semibold">
+                  {avgPcsPerCtn.toLocaleString('en-IN', { maximumFractionDigits: 2 })} PCS
                 </span>
               </div>
             )}

@@ -1,34 +1,26 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, Suspense } from 'react'
 import Link from 'next/link'
-import { format, formatDistanceToNow } from 'date-fns'
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-} from 'recharts'
-import { ArrowDownRight, ArrowUpRight, AlertTriangle } from 'lucide-react'
+import { format } from 'date-fns'
+import { ArrowDownRight, ArrowUpRight, ChevronDown } from 'lucide-react'
 import { useAuthStore } from '@/store/authStore'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { DateRangePicker } from '@/components/ui/DateRangePicker'
 import { AmountDisplay } from '@/components/ui/AmountDisplay'
-import { TableSkeleton } from '@/components/ui/TableSkeleton'
+import { Input } from '@/components/ui/input'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { apiGet } from '@/lib/api-client'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import type { DateRange } from 'react-day-picker'
+import { useUrlParams, useSyncUrlParams, dateRangeParams, boolParam } from '@/hooks/useUrlFilters'
+import { RevenueExclusionToggle } from '@/components/reports/RevenueExclusionToggle'
 
-type DashboardPeriod = 'today' | 'week' | 'month' | 'year' | 'custom'
+type DashboardPeriod = 'today' | 'yesterday' | 'week' | 'month' | 'year' | 'custom'
+const DASHBOARD_PERIODS: DashboardPeriod[] = ['today', 'yesterday', 'week', 'month', 'year', 'custom']
 
 interface DashboardPnl {
   summary: {
@@ -38,6 +30,7 @@ interface DashboardPnl {
     expenses: number
     netProfit: number
     margin: number
+    ctnSold: number
   }
   trends: {
     revenue: number
@@ -45,10 +38,12 @@ interface DashboardPnl {
     grossProfit: number
     expenses: number
     netProfit: number
+    ctnSold: number
   }
   chartData: { label: string; revenue: number; cost: number; netProfit: number }[]
   topCompanies: { name: string; revenue: number; profit: number }[]
   recentBills: { id: string; billNumber: number; company: string; amount: number; date: string | Date }[]
+  revenueExclusion?: { companies: { id: string; name: string }[]; included: boolean }
 }
 
 interface DashboardStats {
@@ -58,6 +53,10 @@ interface DashboardStats {
   totalPositiveOutstanding: number
   totalNegativeOutstanding: number
   pendingPaymentsCount: number
+  totalLiabilities: number
+  totalInvestment: number
+  allTimeNetProfit: number
+  localConst: number
 }
 
 interface DashboardInventoryValue {
@@ -70,6 +69,7 @@ interface DashboardChinaBankHealth {
   balance: number
   lockedThisMonth: number
   readyToLock: number
+  readyToLockProducts: { productId: string; productName: string }[]
 }
 
 interface DashboardStockMovement {
@@ -129,9 +129,12 @@ interface DashboardOutstandingAging {
 
 interface DashboardDeadStockRow {
   productName: string
+  source: 'China' | 'India'
   availableCtn: number
+  availablePcs: number
   inventoryValue: number
-  daysSinceLastSale: number
+  daysNotSold: number
+  neverSold: boolean
 }
 
 interface ExtendedDashboardStats extends DashboardStats {
@@ -155,25 +158,54 @@ interface ExtendedDashboardStats extends DashboardStats {
   }
 }
 
-interface ActivityItem {
-  icon: string
-  type: string
-  description: string
-  amount?: number
-  createdAt: string | Date
-  link?: string
-}
-
-export default function DashboardPage() {
+function DashboardPageContent() {
   const { user } = useAuthStore()
-  const [period, setPeriod] = useState<DashboardPeriod>('month')
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
+  const url = useUrlParams()
+  const [period, setPeriod] = useState<DashboardPeriod>(() => url.oneOf('period', DASHBOARD_PERIODS, 'today'))
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
   const [loadingPnl, setLoadingPnl] = useState(true)
   const [loadingStats, setLoadingStats] = useState(true)
   const [pnl, setPnl] = useState<DashboardPnl | null>(null)
   const [stats, setStats] = useState<ExtendedDashboardStats | null>(null)
-  const [loadingActivity, setLoadingActivity] = useState(true)
-  const [activity, setActivity] = useState<ActivityItem[] | null>(null)
+  const [daysFilter, setDaysFilter] = useState(() => url.str('days'))
+  const [statsOpen, setStatsOpen] = useState(false)
+  // Companies flagged "Exclude from revenue" stay out of Revenue / Cost unless switched on
+  const [includeExcluded, setIncludeExcluded] = useState(() => url.bool('includeExcluded', false))
+  const [comparisonMonths, setComparisonMonths] = useState<'6' | '12'>(() =>
+    url.oneOf('months', ['6', '12'], '6')
+  )
+  const [productsTab, setProductsTab] = useState<'byDays' | 'never'>(() =>
+    url.oneOf('productsTab', ['byDays', 'never'], 'byDays')
+  )
+
+  useSyncUrlParams({
+    period: period !== 'today' ? period : undefined,
+    ...(period === 'custom' ? dateRangeParams(dateRange) : {}),
+    days: daysFilter.trim(),
+    productsTab: productsTab !== 'byDays' ? productsTab : undefined,
+    months: comparisonMonths !== '6' ? comparisonMonths : undefined,
+    includeExcluded: boolParam(includeExcluded, false),
+  })
+
+  // API returns the last 12 months (oldest first); show the latest 6 or all 12
+  const comparisonRows = useMemo(
+    () => (stats?.monthlyComparison ?? []).slice(-Number(comparisonMonths)),
+    [stats, comparisonMonths]
+  )
+  const comparisonTotals = useMemo(
+    () =>
+      comparisonRows.reduce(
+        (t, m) => ({
+          revenue: t.revenue + m.revenue,
+          cost: t.cost + m.cost,
+          profit: t.profit + m.profit,
+          expenses: t.expenses + m.expenses,
+          netProfit: t.netProfit + m.netProfit,
+        }),
+        { revenue: 0, cost: 0, profit: 0, expenses: 0, netProfit: 0 }
+      ),
+    [comparisonRows]
+  )
 
   const buildPnlParams = useCallback(() => {
     const params = new URLSearchParams()
@@ -182,8 +214,9 @@ export default function DashboardPage() {
       params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
       params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
     }
+    if (includeExcluded) params.set('includeExcluded', '1')
     return params
-  }, [period, dateRange])
+  }, [period, dateRange, includeExcluded])
 
   const fetchPnl = useCallback(async () => {
     if (period === 'custom' && (!dateRange?.from || !dateRange.to)) return
@@ -210,8 +243,9 @@ export default function DashboardPage() {
       params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
       params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
     }
+    if (includeExcluded) params.set('includeExcluded', '1')
     return params
-  }, [period, dateRange])
+  }, [period, dateRange, includeExcluded])
 
   const fetchStats = useCallback(async () => {
     setLoadingStats(true)
@@ -230,22 +264,6 @@ export default function DashboardPage() {
     }
   }, [buildStatsParams])
 
-  const fetchActivity = useCallback(async () => {
-    setLoadingActivity(true)
-    try {
-      const res = await apiGet<ActivityItem[]>('/api/dashboard/activity')
-      if (!res.success) {
-        toast.error(res.message)
-        return
-      }
-      setActivity(res.data)
-    } catch {
-      toast.error('Failed to load recent activity')
-    } finally {
-      setLoadingActivity(false)
-    }
-  }, [])
-
   useEffect(() => {
     fetchPnl()
   }, [fetchPnl])
@@ -254,16 +272,10 @@ export default function DashboardPage() {
     fetchStats()
   }, [fetchStats])
 
-  useEffect(() => {
-    fetchActivity()
-  }, [fetchActivity])
-
   const handlePeriodChange = (next: DashboardPeriod) => {
     setPeriod(next)
     if (next !== 'custom') setDateRange(undefined)
   }
-
-  const hasChartData = pnl && pnl.chartData && pnl.chartData.length > 0
 
   const renderTrend = (value: number) => {
     const rounded = Number.isFinite(value) ? value.toFixed(1) : '0.0'
@@ -290,6 +302,76 @@ export default function DashboardPage() {
   const marginColor =
     margin > 20 ? 'text-emerald-600' : margin >= 10 ? 'text-amber-600' : 'text-red-600'
 
+  const renderProductsTable = (
+    rows: DashboardDeadStockRow[],
+    daysLabel: string
+  ) => {
+    if (rows.length === 0) {
+      return (
+        <p className="py-6 text-center text-sm text-muted-foreground">
+          No products to show.
+        </p>
+      )
+    }
+    return (
+      <div className="max-h-[420px] overflow-y-auto rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0">
+            <tr className="border-b bg-muted/50">
+              <th className="p-2 text-left font-medium">Product</th>
+              <th className="p-2 text-left font-medium">Warehouse</th>
+              <th className="p-2 text-right font-medium">Available CTN</th>
+              <th className="p-2 text-right font-medium">Available Pcs</th>
+              <th className="p-2 text-right font-medium">Stock Value</th>
+              <th className="p-2 text-right font-medium">{daysLabel}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((d, idx) => (
+              <tr
+                key={idx}
+                className={cn(
+                  'border-b last:border-0',
+                  d.daysNotSold > 60
+                    ? 'bg-red-50/60'
+                    : d.daysNotSold > 30
+                    ? 'bg-amber-50/60'
+                    : ''
+                )}
+              >
+                <td className="p-2">{d.productName}</td>
+                <td className="p-2 text-muted-foreground">{d.source}</td>
+                <td className="p-2 text-right">{d.availableCtn}</td>
+                <td className="p-2 text-right">
+                  {d.availablePcs.toLocaleString('en-IN')}
+                </td>
+                <td className="p-2 text-right">
+                  <AmountDisplay
+                    amount={
+                      Number.isFinite(d.inventoryValue) ? d.inventoryValue : 0
+                    }
+                  />
+                </td>
+                <td
+                  className={cn(
+                    'p-2 text-right font-medium',
+                    d.daysNotSold > 60
+                      ? 'text-red-600'
+                      : d.daysNotSold > 30
+                      ? 'text-amber-600'
+                      : 'text-emerald-600'
+                  )}
+                >
+                  {d.daysNotSold}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -304,6 +386,7 @@ export default function DashboardPage() {
             {(
               [
                 ['today', 'Today'],
+                ['yesterday', 'Yesterday'],
                 ['week', 'This Week'],
                 ['month', 'This Month'],
                 ['year', 'This Year'],
@@ -346,8 +429,8 @@ export default function DashboardPage() {
       {/* P&L summary row */}
       <section className="space-y-4">
         {loadingPnl ? (
-          <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
-            {Array.from({ length: 6 }).map((_, i) => (
+          <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-7">
+            {Array.from({ length: 7 }).map((_, i) => (
               <Card key={i} className="animate-pulse">
                 <CardContent className="space-y-2 pt-4">
                   <div className="h-3 w-20 rounded bg-muted" />
@@ -358,10 +441,18 @@ export default function DashboardPage() {
             ))}
           </div>
         ) : pnl ? (
-          <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
+          <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-7">
             <Card>
               <CardContent className="pt-4 space-y-1">
-                <p className="text-xs text-muted-foreground">Revenue</p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-muted-foreground">Revenue</p>
+                  <RevenueExclusionToggle
+                    compact
+                    companies={pnl.revenueExclusion?.companies}
+                    included={includeExcluded}
+                    onChange={setIncludeExcluded}
+                  />
+                </div>
                 <p className="text-xl font-semibold">
                   <AmountDisplay amount={pnl.summary.revenue} />
                 </p>
@@ -423,6 +514,15 @@ export default function DashboardPage() {
                 <p className="text-xs text-muted-foreground">
                   Net profit / revenue
                 </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4 space-y-1">
+                <p className="text-xs text-muted-foreground">CTN Sold</p>
+                <p className="text-xl font-semibold text-blue-600">
+                  {pnl.summary.ctnSold}
+                </p>
+                {renderTrend(pnl.trends.ctnSold)}
               </CardContent>
             </Card>
           </div>
@@ -495,8 +595,24 @@ export default function DashboardPage() {
       </section>
       */}
 
-      {/* Quick stats row */}
-      <section>
+      {/* Quick stats row (collapsible, closed by default) */}
+      <section className="overflow-hidden rounded-lg border">
+        <button
+          type="button"
+          onClick={() => setStatsOpen((o) => !o)}
+          aria-expanded={statsOpen}
+          className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left hover:bg-muted/40"
+        >
+          <span className="text-sm font-semibold">Balances &amp; Financial Summary</span>
+          <ChevronDown
+            className={cn(
+              'h-4 w-4 shrink-0 text-muted-foreground transition-transform',
+              statsOpen && 'rotate-180'
+            )}
+          />
+        </button>
+        {statsOpen && (
+          <div className="space-y-3 border-t p-4">
         {loadingStats ? (
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -509,114 +625,8 @@ export default function DashboardPage() {
             ))}
           </div>
         ) : stats ? (
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-            <Link href="/china-bank">
-              <Card
-                className={cn(
-                  'transition hover:shadow-sm',
-                  stats.chinaBankBalance < 0 && 'border-destructive/50 bg-destructive/5'
-                )}
-              >
-                <CardContent className="flex items-start justify-between pt-4">
-                  <div>
-                    <p className="text-xs text-muted-foreground flex items-center gap-1">
-                      China Bank Balance
-                      {stats.chinaBankBalance < 0 && (
-                        <AlertTriangle className="h-3 w-3 text-destructive" />
-                      )}
-                    </p>
-                    <p
-                      className={cn(
-                        'text-xl font-semibold',
-                        stats.chinaBankBalance < 0 && 'text-destructive'
-                      )}
-                    >
-                      <AmountDisplay amount={stats.chinaBankBalance} />
-                    </p>
-                  </div>
-                </CardContent>
-              </Card>
-            </Link>
-
-            <Link href="/banks">
-              <Card
-                className={cn(
-                  'transition hover:shadow-sm',
-                  stats.cashBalance < 0 && 'border-destructive/50 bg-destructive/5'
-                )}
-              >
-                <CardContent className="pt-4">
-                  <p className="text-xs text-muted-foreground">Cash Balance</p>
-                  <p
-                    className={cn(
-                      'text-xl font-semibold',
-                      stats.cashBalance < 0 && 'text-destructive'
-                    )}
-                  >
-                    <AmountDisplay amount={stats.cashBalance} />
-                  </p>
-                </CardContent>
-              </Card>
-            </Link>
-
-            <Link href="/companies">
-              <Card className="transition hover:shadow-sm">
-                <CardContent className="pt-4 space-y-2">
-                  <p className="text-xs text-muted-foreground">Total Outstanding</p>
-                  <div className="flex gap-4">
-                    <div>
-                      <p className="text-[11px] text-muted-foreground">To Receive</p>
-                      <p className="text-base font-semibold text-red-600">
-                        <AmountDisplay amount={stats.totalPositiveOutstanding ?? 0} />
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-[11px] text-muted-foreground">Advance/Credit</p>
-                      <p className="text-base font-semibold text-blue-600">
-                        <AmountDisplay amount={stats.totalNegativeOutstanding ?? 0} />
-                      </p>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            </Link>
-
-            <Link href="/products">
-              <Card className="transition hover:shadow-sm">
-                <CardContent className="pt-4">
-                  <p className="text-xs text-muted-foreground">Pending Payments</p>
-                  <p className="text-xl font-semibold">
-                    {stats.pendingPaymentsCount}
-                  </p>
-                </CardContent>
-              </Card>
-            </Link>
-          </div>
-        ) : null}
-      </section>
-
-      {/* Inventory, China bank health, cash flow, stock movement */}
-      {stats && (
-        <section>
+          <>
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm font-medium">Inventory Value</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <p className="text-xl font-semibold">
-                  <AmountDisplay amount={stats.inventoryValue.total} />
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  China: <AmountDisplay amount={stats.inventoryValue.chinaProducts} /> · India:{' '}
-                  <AmountDisplay amount={stats.inventoryValue.indiaProducts} />
-                </p>
-                <Button asChild variant="outline" size="sm">
-                  <Link href="/reports">View stock report</Link>
-                </Button>
-              </CardContent>
-            </Card>
-
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm font-medium">China Bank Health</CardTitle>
@@ -643,70 +653,124 @@ export default function DashboardPage() {
                   <span>Ready to lock</span>
                   <span>{stats.chinaBankHealth.readyToLock}</span>
                 </div>
-                {stats.chinaBankHealth.readyToLock > 0 && (
-                  <Button asChild variant="outline" size="sm">
-                    <Link href="/products">
-                      {stats.chinaBankHealth.readyToLock} entries ready to lock
-                    </Link>
-                  </Button>
-                )}
+                {stats.chinaBankHealth.readyToLock > 0 && (() => {
+                  const products = stats.chinaBankHealth.readyToLockProducts ?? []
+                  const href = products.length === 1
+                    ? `/products/${products[0].productId}`
+                    : '/products'
+                  const label = products.length === 1
+                    ? `${stats.chinaBankHealth.readyToLock} ${stats.chinaBankHealth.readyToLock === 1 ? 'entry' : 'entries'} ready to lock — ${products[0].productName}`
+                    : `${stats.chinaBankHealth.readyToLock} entries ready to lock`
+                  return (
+                    <Button asChild variant="outline" size="sm">
+                      <Link href={href}>{label}</Link>
+                    </Button>
+                  )
+                })()}
               </CardContent>
             </Card>
 
             <Card>
-              <CardHeader>
-                <CardTitle className="text-sm font-medium">Cash Flow (This Month)</CardTitle>
+              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                <CardTitle className="text-sm font-medium">Inventory Value</CardTitle>
+                <Button asChild variant="ghost" size="sm" className="h-auto px-0 text-xs text-muted-foreground hover:text-foreground hover:bg-transparent">
+                  <Link href="/reports">View stock report →</Link>
+                </Button>
               </CardHeader>
               <CardContent className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span>Money IN</span>
-                  <span className="text-emerald-600 font-medium">
-                    <AmountDisplay amount={stats.cashFlow.moneyIn} />
+                  <span className="text-muted-foreground">China Products</span>
+                  <span className="font-medium">
+                    <AmountDisplay amount={stats.inventoryValue.chinaProducts} />
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Money OUT</span>
-                  <span className="text-red-600 font-medium">
-                    <AmountDisplay amount={stats.cashFlow.moneyOut} />
+                  <span className="text-muted-foreground">India Products</span>
+                  <span className="font-medium">
+                    <AmountDisplay amount={stats.inventoryValue.indiaProducts} />
                   </span>
                 </div>
-                <div className="flex justify-between">
-                  <span>Net Cash Flow</span>
-                  <span
-                    className={cn(
-                      'font-semibold',
-                      stats.cashFlow.netCashFlow < 0 ? 'text-red-600' : 'text-emerald-600'
-                    )}
-                  >
-                    <AmountDisplay amount={stats.cashFlow.netCashFlow} />
+                <div className="border-t pt-2 flex justify-between">
+                  <span className="font-semibold">Total</span>
+                  <span className="text-lg font-bold text-emerald-600">
+                    <AmountDisplay amount={stats.inventoryValue.total} />
                   </span>
                 </div>
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm font-medium">Stock Movement</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span>CTN Bought</span>
-                  <span>{stats.stockMovement.ctnBoughtThisPeriod}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>CTN Sold</span>
-                  <span>{stats.stockMovement.ctnSoldThisPeriod}</span>
-                </div>
-                {stats.stockMovement.ctnSoldThisPeriod >
-                stats.stockMovement.ctnBoughtThisPeriod ? (
-                  <p className="text-xs text-emerald-600 font-medium">Good turnover</p>
-                ) : stats.stockMovement.ctnBoughtThisPeriod >
-                  stats.stockMovement.ctnSoldThisPeriod * 2 ? (
-                  <p className="text-xs text-amber-600 font-medium">Stock building up</p>
-                ) : null}
-              </CardContent>
-            </Card>
+            <Link href="/banks">
+              <Card className="transition hover:shadow-sm">
+                <CardHeader>
+                  <CardTitle className="text-sm font-medium">Total Cash &amp; Bank Balance</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  {(() => {
+                    const bankTotal = stats.bankBalances.reduce((sum, b) => sum + b.balance, 0)
+                    const grandTotal = stats.cashBalance + bankTotal
+                    return (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Cash</span>
+                          <span className={cn('font-medium', stats.cashBalance < 0 && 'text-destructive')}>
+                            <AmountDisplay amount={stats.cashBalance} />
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Banks</span>
+                          <span className={cn('font-medium', bankTotal < 0 && 'text-destructive')}>
+                            <AmountDisplay amount={bankTotal} />
+                          </span>
+                        </div>
+                        <div className="border-t pt-2 flex justify-between">
+                          <span className="font-semibold">Total</span>
+                          <span className={cn('text-lg font-bold', grandTotal < 0 ? 'text-destructive' : 'text-emerald-600')}>
+                            <AmountDisplay amount={grandTotal} />
+                          </span>
+                        </div>
+                      </>
+                    )
+                  })()}
+                </CardContent>
+              </Card>
+            </Link>
 
+            <Link href="/companies">
+              <Card className="transition hover:shadow-sm">
+                <CardHeader>
+                  <CardTitle className="text-sm font-medium">Net Outstanding</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">To Receive</span>
+                    <span className={cn('font-medium', stats.totalPositiveOutstanding > 0 && 'text-red-600')}>
+                      <AmountDisplay amount={stats.totalPositiveOutstanding} />
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Credit</span>
+                    <span className={cn('font-medium', stats.totalNegativeOutstanding > 0 && 'text-emerald-600')}>
+                      <AmountDisplay amount={stats.totalNegativeOutstanding} />
+                    </span>
+                  </div>
+                  <div className="border-t pt-2 flex justify-between">
+                    <span className="font-semibold">Net</span>
+                    <span
+                      className={cn(
+                        'text-lg font-bold',
+                        (stats.totalPositiveOutstanding - stats.totalNegativeOutstanding) >= 0
+                          ? 'text-red-600'
+                          : 'text-emerald-600'
+                      )}
+                    >
+                      <AmountDisplay amount={stats.totalPositiveOutstanding - stats.totalNegativeOutstanding} />
+                    </span>
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+
+            {/* Containers card — hidden for now
             {stats.containers != null && (
               <Card>
                 <CardHeader>
@@ -740,121 +804,160 @@ export default function DashboardPage() {
                   </Button>
                 </CardContent>
               </Card>
-            )}
+            )} */}
           </div>
-        </section>
-      )}
 
-      {/* Outstanding aging & top products */}
-      {stats && (
-        <section className="grid gap-4 lg:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>Outstanding Aging</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="grid grid-cols-3 gap-2 text-xs">
-                <div className="rounded border border-emerald-500/60 bg-emerald-50/40 p-2">
-                  <p className="text-[11px] text-emerald-700">0-30 days</p>
-                  <p className="text-sm font-semibold">
-                    <AmountDisplay amount={stats.outstandingAging.within30Days} />
-                  </p>
-                </div>
-                <div className="rounded border border-amber-500/60 bg-amber-50/40 p-2">
-                  <p className="text-[11px] text-amber-700">30-60 days</p>
-                  <p className="text-sm font-semibold">
-                    <AmountDisplay amount={stats.outstandingAging.days30to60} />
-                  </p>
-                </div>
-                <div className="rounded border border-red-500/60 bg-red-50/60 p-2">
-                  <p className="text-[11px] text-red-700">60+ days</p>
-                  <p className="text-sm font-semibold">
-                    <AmountDisplay amount={stats.outstandingAging.over60Days} />
-                  </p>
-                </div>
-              </div>
-              <div className="rounded-md border overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b bg-muted/50">
-                      <th className="p-2 text-left font-medium">Company</th>
-                      <th className="p-2 text-right font-medium">Outstanding</th>
-                      <th className="p-2 text-right font-medium">Days</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stats.outstandingAging.companies.map((c, idx) => (
-                      <tr key={idx} className="border-b last:border-0">
-                        <td className="p-2">{c.name}</td>
-                        <td className="p-2 text-right">
-                          <AmountDisplay amount={c.outstanding} />
-                        </td>
-                        <td
-                          className={cn(
-                            'p-2 text-right',
-                            c.daysPending > 60
-                              ? 'text-red-600'
-                              : c.daysPending > 30
-                              ? 'text-amber-600'
-                              : 'text-emerald-600'
-                          )}
-                        >
-                          {c.daysPending}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <Button asChild variant="outline" size="sm">
-                <Link href="/companies">View All</Link>
-              </Button>
-            </CardContent>
-          </Card>
+          {/* Grand total & investment formula rows */}
+          {(() => {
+            const bankTotal = stats.bankBalances.reduce((sum, b) => sum + b.balance, 0)
+            const cashAndBanks = stats.cashBalance + bankTotal
+            const toReceive = stats.totalPositiveOutstanding
+            const liabilities = stats.totalLiabilities ?? 0
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Top 5 Products (this period)</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="rounded-md border overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b bg-muted/50">
-                      <th className="p-2 text-left font-medium">Product</th>
-                      <th className="p-2 text-right font-medium">Units</th>
-                      <th className="p-2 text-right font-medium">Profit</th>
-                      <th className="p-2 text-right font-medium">Margin %</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stats.topProducts.map((p, idx) => (
-                      <tr key={idx} className="border-b last:border-0">
-                        <td className="p-2">{p.name}</td>
-                        <td className="p-2 text-right">{p.unitsSold}</td>
-                        <td className="p-2 text-right">
-                          <AmountDisplay amount={p.profit} />
-                        </td>
-                        <td className="p-2 text-right">{p.margin.toFixed(1)}%</td>
-                      </tr>
+            const skyLandMart = stats.bankBalances.find((b) => b.accountName === 'SKY LAND MART')?.balance ?? 0
+            const yashasviIntl = stats.bankBalances.find((b) => b.accountName === 'YASHASVI INTERNATIONAL')?.balance ?? 0
+            const adjustedCashAndBanks = cashAndBanks - skyLandMart - yashasviIntl
+            const grandTotal = stats.inventoryValue.total + stats.chinaBankHealth.balance + adjustedCashAndBanks + toReceive + liabilities
+            const finalTotal = grandTotal + skyLandMart + yashasviIntl
+
+            const grandTotalItems = [
+              { label: 'China Bank', value: stats.chinaBankHealth.balance },
+              { label: 'Inventory', value: stats.inventoryValue.total },
+              { label: 'Cash & Banks', value: adjustedCashAndBanks },
+              { label: 'To Receive', value: toReceive },
+              { label: 'Liabilities', value: liabilities },
+            ]
+
+            const creditOutstanding = stats.totalNegativeOutstanding
+            const netProfit = stats.allTimeNetProfit
+            const investmentTotal = stats.totalInvestment + creditOutstanding + netProfit + stats.localConst
+            const diff = investmentTotal - grandTotal
+
+            const items = [
+              { label: 'Total Investment', value: stats.totalInvestment },
+              { label: 'Outstanding (Credit)', value: creditOutstanding },
+              { label: 'Net Profit (All Time)', value: netProfit },
+              { label: 'Local Const', value: stats.localConst },
+            ]
+
+            return (
+              <>
+                <div className="mt-3 rounded-lg border bg-muted/20 px-6 py-4">
+                  <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-4">
+                    {grandTotalItems.map((item, idx) => (
+                      <div key={item.label} className="flex items-center gap-x-5">
+                        <div className="text-center">
+                          <p className="text-xs text-muted-foreground mb-1">{item.label}</p>
+                          <p className={cn('font-semibold text-base', item.value < 0 ? 'text-red-600' : '')}>
+                            <AmountDisplay amount={item.value} />
+                          </p>
+                        </div>
+                        {idx < grandTotalItems.length - 1 && (
+                          <span className="text-xl text-muted-foreground font-light select-none">+</span>
+                        )}
+                      </div>
                     ))}
-                  </tbody>
-                </table>
-              </div>
-              <Button asChild variant="outline" size="sm">
-                <Link href="/reports">View Full Report</Link>
-              </Button>
-            </CardContent>
-          </Card>
-        </section>
-      )}
+                    <span className="text-xl font-medium text-muted-foreground select-none px-1">=</span>
+                    <div className="text-center">
+                      <p className="text-xs text-muted-foreground mb-1">Grand Total</p>
+                      <p className={cn('text-xl font-bold', grandTotal >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                        <AmountDisplay amount={grandTotal} />
+                      </p>
+                    </div>
+                    <span className="text-xl text-muted-foreground font-light select-none">+</span>
+                    <div className="text-center">
+                      <p className="text-xs text-muted-foreground mb-1">Sky Land Mart</p>
+                      <p className="font-semibold text-base">
+                        <AmountDisplay amount={skyLandMart} />
+                      </p>
+                    </div>
+                    <span className="text-xl text-muted-foreground font-light select-none">+</span>
+                    <div className="text-center">
+                      <p className="text-xs text-muted-foreground mb-1">Yashasvi International</p>
+                      <p className="font-semibold text-base">
+                        <AmountDisplay amount={yashasviIntl} />
+                      </p>
+                    </div>
+                    <span className="text-xl font-medium text-muted-foreground select-none px-1">=</span>
+                    <div className="text-center">
+                      <p className="text-xs text-muted-foreground mb-1">Total</p>
+                      <p className={cn('text-xl font-bold', finalTotal >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                        <AmountDisplay amount={finalTotal} />
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-3 rounded-lg border bg-muted/20 px-4 py-3">
+                  <div className="flex items-center justify-center gap-x-3 overflow-x-auto">
+                    {items.map((item, idx) => (
+                      <div key={item.label} className="flex items-center gap-x-3 shrink-0">
+                        <div className="text-center">
+                          <p className="text-xs text-muted-foreground mb-1">{item.label}</p>
+                          <p className={cn('font-semibold text-base', item.value < 0 ? 'text-red-600' : '')}>
+                            <AmountDisplay amount={item.value} />
+                          </p>
+                        </div>
+                        {idx < items.length - 1 && (
+                          <span className="text-xl text-muted-foreground font-light select-none">+</span>
+                        )}
+                      </div>
+                    ))}
+                    <span className="text-xl font-medium text-muted-foreground select-none shrink-0">=</span>
+                    <div className="text-center shrink-0">
+                      <p className="text-xs text-muted-foreground mb-1">Total</p>
+                      <p className={cn('text-xl font-bold', investmentTotal >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                        <AmountDisplay amount={investmentTotal} />
+                      </p>
+                    </div>
+                    <span className="text-xl text-muted-foreground font-light select-none shrink-0">-</span>
+                    <div className="text-center shrink-0">
+                      <p className="text-xs text-muted-foreground mb-1">Grand Total</p>
+                      <p className="font-semibold text-base">
+                        <AmountDisplay amount={grandTotal} />
+                      </p>
+                    </div>
+                    <span className="text-xl font-medium text-muted-foreground select-none shrink-0">=</span>
+                    <div className="text-center shrink-0">
+                      <p className="text-xs text-muted-foreground mb-1">Difference</p>
+                      <p className={cn('text-xl font-bold', diff >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                        <AmountDisplay amount={diff} />
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )
+          })()}
+          </>
+        ) : null}
+          </div>
+        )}
+      </section>
 
       {/* Monthly comparison table */}
       {stats && (
         <section>
           <Card>
-            <CardHeader>
-              <CardTitle>Monthly Comparison (last 6 months)</CardTitle>
+            <CardHeader className="flex flex-row flex-wrap items-center gap-3 space-y-0">
+              <CardTitle>Monthly Comparison</CardTitle>
+              <div className="inline-flex rounded-md border bg-muted/40 p-1 text-xs">
+                {(['6', '12'] as const).map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => setComparisonMonths(n)}
+                    className={cn(
+                      'rounded px-2 py-1 font-medium',
+                      comparisonMonths === n
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'text-muted-foreground hover:bg-background'
+                    )}
+                  >
+                    {n} Months
+                  </button>
+                ))}
+              </div>
             </CardHeader>
             <CardContent className="space-y-2">
               <div className="rounded-md border overflow-x-auto">
@@ -871,7 +974,7 @@ export default function DashboardPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {stats.monthlyComparison.map((m, idx, arr) => (
+                    {comparisonRows.map((m, idx, arr) => (
                       <tr
                         key={m.month}
                         className={cn(
@@ -904,6 +1007,40 @@ export default function DashboardPage() {
                       </tr>
                     ))}
                   </tbody>
+                  {comparisonRows.length > 1 && (
+                    <tfoot>
+                      <tr className="border-t bg-muted/50 font-semibold">
+                        <td className="p-2">Total</td>
+                        <td className="p-2 text-right">
+                          <AmountDisplay amount={comparisonTotals.revenue} />
+                        </td>
+                        <td className="p-2 text-right">
+                          <AmountDisplay amount={comparisonTotals.cost} />
+                        </td>
+                        <td className="p-2 text-right">
+                          <AmountDisplay amount={comparisonTotals.profit} />
+                        </td>
+                        <td className="p-2 text-right">
+                          <AmountDisplay amount={comparisonTotals.expenses} />
+                        </td>
+                        <td
+                          className={cn(
+                            'p-2 text-right',
+                            comparisonTotals.netProfit < 0 ? 'text-red-600' : 'text-emerald-600'
+                          )}
+                        >
+                          <AmountDisplay amount={comparisonTotals.netProfit} />
+                        </td>
+                        <td className="p-2 text-right">
+                          {(comparisonTotals.revenue > 0
+                            ? (comparisonTotals.netProfit / comparisonTotals.revenue) * 100
+                            : 0
+                          ).toFixed(1)}
+                          %
+                        </td>
+                      </tr>
+                    </tfoot>
+                  )}
                 </table>
               </div>
               <Button asChild variant="outline" size="sm">
@@ -914,233 +1051,93 @@ export default function DashboardPage() {
         </section>
       )}
 
-      {/* Recent activity, Sophia balances, bank balances */}
-      <section className="grid gap-4 lg:grid-cols-3">
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent Activity</CardTitle>
-          </CardHeader>
-          <CardContent className="max-h-[260px] space-y-2 overflow-y-auto text-sm">
-            {loadingActivity ? (
-              <TableSkeleton rows={5} columns={2} />
-            ) : activity && activity.length > 0 ? (
-              activity.map((a, idx) => (
-                <div
-                  key={idx}
-                  className={cn(
-                    'flex cursor-pointer items-start gap-2 rounded px-2 py-1.5 hover:bg-muted'
-                  )}
-                  onClick={() => a.link && (window.location.href = a.link)}
+      {/* Products not sold — Never Sold vs aging-by-days */}
+      {stats && (() => {
+        const all = stats.deadStock ?? []
+        const neverSold = all
+          .filter((d) => d.neverSold)
+          .sort((a, b) => b.daysNotSold - a.daysNotSold)
+        const soldAll = all.filter((d) => !d.neverSold)
+        const threshold = daysFilter.trim() === '' ? 0 : Number(daysFilter)
+        const minDays =
+          Number.isFinite(threshold) && threshold > 0 ? threshold : 0
+        const soldFiltered = soldAll
+          .filter((d) => d.daysNotSold >= minDays)
+          .sort((a, b) => b.daysNotSold - a.daysNotSold)
+        return (
+          <section>
+            <Card>
+              <CardHeader>
+                <CardTitle>Products Not Sold</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <Tabs
+                  value={productsTab}
+                  onValueChange={(v) => setProductsTab(v as 'byDays' | 'never')}
                 >
-                  <span className="mt-0.5">{a.icon}</span>
-                  <div className="flex-1">
-                    <p className="text-xs">{a.description}</p>
-                    <p className="text-[11px] text-muted-foreground">
-                      {formatDistanceToNow(new Date(a.createdAt), { addSuffix: true })}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <TabsList>
+                      <TabsTrigger value="byDays">
+                        By Days ({soldAll.length})
+                      </TabsTrigger>
+                      <TabsTrigger value="never">
+                        Never Sold ({neverSold.length})
+                      </TabsTrigger>
+                    </TabsList>
+                    {productsTab === 'byDays' && (
+                      <div className="flex items-center gap-2">
+                        <Input
+                          type="number"
+                          min={0}
+                          inputMode="numeric"
+                          value={daysFilter}
+                          onChange={(e) => setDaysFilter(e.target.value)}
+                          placeholder="Enter days e.g. 10"
+                          className="h-9 w-40"
+                        />
+                        {daysFilter.trim() !== '' && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setDaysFilter('')}
+                          >
+                            Clear
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <TabsContent value="byDays" className="mt-3 space-y-2">
+                    <p className="text-xs text-muted-foreground">
+                      {minDays > 0
+                        ? `${soldFiltered.length} product${soldFiltered.length === 1 ? '' : 's'} with stock sitting unsold for ${minDays}+ days`
+                        : `${soldFiltered.length} previously-sold product${soldFiltered.length === 1 ? '' : 's'} still in stock — days their current stock has sat unsold`}
                     </p>
-                  </div>
-                  {typeof a.amount === 'number' && (
-                    <span className="text-xs font-medium">
-                      <AmountDisplay amount={a.amount} />
-                    </span>
-                  )}
-                </div>
-              ))
-            ) : (
-              <p className="text-xs text-muted-foreground">No recent activity.</p>
-            )}
-          </CardContent>
-        </Card>
+                    {renderProductsTable(soldFiltered, 'Days Not Sold')}
+                  </TabsContent>
 
-        {stats && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Sophia Balances</CardTitle>
-            </CardHeader>
-            <CardContent className="max-h-[260px] space-y-2 overflow-y-auto text-sm">
-              {stats.jackBalances.map((j) => (
-                    <div
-                      key={j.name}
-                      className="flex items-center justify-between rounded px-2 py-1 hover:bg-muted cursor-pointer"
-                      onClick={() =>
-                        (window.location.href = `/sophia/${encodeURIComponent(j.name)}`)
-                      }
-                >
-                  <div>
-                    <p className="text-xs font-medium">
-                      {j.name}
-                      {j.isDefault && ' (Default)'}
+                  <TabsContent value="never" className="mt-3 space-y-2">
+                    <p className="text-xs text-muted-foreground">
+                      {neverSold.length} product{neverSold.length === 1 ? '' : 's'} in stock that have never been sold — days their stock has been available
                     </p>
-                  </div>
-                  <p
-                    className={cn(
-                      'text-xs font-semibold',
-                      j.balance < 0 && 'text-red-600'
-                    )}
-                  >
-                    ¥{j.balance.toLocaleString('en-IN')}
-                  </p>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-        )}
-
-        {stats && (
-          <Card>
-            <CardHeader>
-              <CardTitle>All Bank Balances</CardTitle>
-            </CardHeader>
-            <CardContent className="max-h-[260px] space-y-2 overflow-y-auto text-sm">
-              {stats.bankBalances.map((b) => (
-                <div
-                  key={b.id}
-                  className="flex items-center justify-between rounded px-2 py-1 hover:bg-muted cursor-pointer"
-                  onClick={() =>
-                    (window.location.href = `/banks/${encodeURIComponent(b.id)}`)
-                  }
-                >
-                  <div>
-                    <p className="text-xs font-medium">{b.accountName}</p>
-                    <p className="text-[11px] text-muted-foreground">{b.type}</p>
-                  </div>
-                  <p
-                    className={cn(
-                      'text-xs font-semibold',
-                      b.balance < 0 && 'text-red-600'
-                    )}
-                  >
-                    <AmountDisplay amount={b.balance} />
-                  </p>
-                </div>
-              ))}
-              <div className="mt-2 border-t pt-2 text-xs flex justify-between">
-                <span>Total</span>
-                <span className="font-semibold">
-                  <AmountDisplay
-                    amount={stats.bankBalances.reduce(
-                      (sum, b) => sum + b.balance,
-                      0
-                    )}
-                  />
-                </span>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-      </section>
-
-      {/* Recent bills + dead stock */}
-      <section className="grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0">
-            <CardTitle>Recent Sale Bills</CardTitle>
-            <Button asChild variant="outline" size="sm">
-              <Link href="/sale-bills">View All</Link>
-            </Button>
-          </CardHeader>
-          <CardContent>
-            {loadingPnl ? (
-              <TableSkeleton rows={5} columns={4} />
-            ) : pnl && pnl.recentBills.length > 0 ? (
-              <div className="rounded-md border overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b bg-muted/50">
-                      <th className="p-2 text-left font-medium">Bill No</th>
-                      <th className="p-2 text-left font-medium">Company</th>
-                      <th className="p-2 text-right font-medium">Amount</th>
-                      <th className="p-2 text-right font-medium">Date</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pnl.recentBills.map((b) => (
-                      <tr
-                        key={b.id}
-                        className="border-b hover:bg-muted/40 cursor-pointer"
-                        onClick={() => (window.location.href = `/sale-bills/${b.id}`)}
-                      >
-                        <td className="p-2">{b.billNumber}</td>
-                        <td className="p-2">{b.company}</td>
-                        <td className="p-2 text-right">
-                          <AmountDisplay amount={b.amount} />
-                        </td>
-                        <td className="p-2 text-right text-xs text-muted-foreground">
-                          {format(new Date(b.date), 'dd MMM yyyy')}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No bills in this period.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-
-        {stats && (
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0">
-              <CardTitle>Dead Stock Alert</CardTitle>
-              <Button asChild variant="outline" size="sm">
-                <Link href="/reports">View Stock Report</Link>
-              </Button>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {stats.deadStock.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No dead stock detected in India warehouse.
-                </p>
-              ) : (
-                <div className="rounded-md border overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="border-b bg-muted/50">
-                        <th className="p-2 text-left font-medium">Product</th>
-                        <th className="p-2 text-right font-medium">Available CTN</th>
-                        <th className="p-2 text-right font-medium">Value</th>
-                        <th className="p-2 text-right font-medium">Days</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {stats.deadStock.map((d, idx) => (
-                        <tr
-                          key={idx}
-                          className={cn(
-                            'border-b last:border-0',
-                            d.daysSinceLastSale > 60
-                              ? 'bg-red-50/60'
-                              : d.daysSinceLastSale > 30
-                              ? 'bg-amber-50/60'
-                              : ''
-                          )}
-                        >
-                          <td className="p-2">{d.productName}</td>
-                          <td className="p-2 text-right">{d.availableCtn}</td>
-                          <td className="p-2 text-right">
-                            <AmountDisplay
-                              amount={
-                                Number.isFinite(d.inventoryValue)
-                                  ? d.inventoryValue
-                                  : 0
-                              }
-                            />
-                          </td>
-                          <td className="p-2 text-right">{d.daysSinceLastSale}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
-      </section>
+                    {renderProductsTable(neverSold, 'Days in Stock')}
+                  </TabsContent>
+                </Tabs>
+              </CardContent>
+            </Card>
+          </section>
+        )
+      })()}
     </div>
   )
 }
 
+export default function DashboardPage() {
+  return (
+    <Suspense fallback={null}>
+      <DashboardPageContent />
+    </Suspense>
+  )
+}

@@ -18,6 +18,12 @@ import { toast } from 'sonner'
 import { cn, calcGrandTotal } from '@/lib/utils'
 import { Check, ChevronsUpDown } from 'lucide-react'
 import {
+  QuickAddCompanyDialog,
+  CompanySelect,
+  ProductSelect,
+  type CompanyOption,
+} from '@/components/sale-bills/selects'
+import {
   Command,
   CommandEmpty,
   CommandGroup,
@@ -25,21 +31,9 @@ import {
   CommandItem,
   CommandList,
 } from '@/components/ui/command'
+import { useListHref } from '@/hooks/useUrlFilters'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-interface CompanyOption {
-  _id: string
-  companyName: string
-}
-
-interface ProductOption {
-  value: string        // "china:<id>" | "india:<id>"
-  label: string        // display name with flag
-  availableCtn: number
-  availablePcs: number
-  qtyPerCtn: number
-}
 
 interface LineRow {
   id: string
@@ -47,6 +41,8 @@ interface LineRow {
   productId: string
   productName: string
   availableCtn: number
+  /** True stock in pcs, summed per batch by the API. Not availableCtn × qtyPerCtn — batches can differ in carton size. */
+  availablePcs: number
   ctnSold: number
   qtyPerCtn: number
   pcsSold: number
@@ -54,266 +50,83 @@ interface LineRow {
   lineTotal: number
 }
 
-// ─── Quick-Add Company Dialog ─────────────────────────────────────────────────
+// ─── Bank Account Select ──────────────────────────────────────────────────────
 
-function QuickAddCompanyDialog({
-  initialName,
-  onCreated,
-  onClose,
+function BankAccountSelect({
+  options,
+  value,
+  onValueChange,
 }: {
-  initialName: string
-  onCreated: (company: { _id: string; companyName: string }) => void
-  onClose: () => void
+  options: { _id: string; accountName: string; currentBalance: number }[]
+  value: string
+  onValueChange: (v: string) => void
 }) {
-  const [companyName, setCompanyName] = useState(initialName)
-  const [mobile, setMobile] = useState('')
-  const [loading, setLoading] = useState(false)
-
-  async function handleCreate() {
-    if (!companyName.trim()) return
-    setLoading(true)
-    const res = await apiPost<{ _id: string; companyName: string }>('/api/companies', {
-      companyName: companyName.trim(),
-      primaryMobile: mobile.trim() || undefined,
-    })
-    setLoading(false)
-    if (!res.success) {
-      toast.error(res.message ?? 'Failed to create company')
-      return
-    }
-    toast.success(`Company "${res.data.companyName}" created`)
-    onCreated(res.data)
-  }
+  const [open, setOpen] = useState(false)
+  const selected = options.find((b) => b._id === value)
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="relative w-full max-w-sm rounded-xl border bg-background p-6 shadow-xl space-y-4">
-        <button
-          onClick={onClose}
-          className="absolute right-4 top-4 text-muted-foreground hover:text-foreground"
-        >
-          <X className="h-4 w-4" />
-        </button>
-        <div className="flex items-center gap-2">
-          <Building2 className="h-5 w-5 text-primary" />
-          <h3 className="font-semibold text-base">Add New Company</h3>
-        </div>
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <Label className="text-xs">Company Name *</Label>
-            <Input
-              autoFocus
-              value={companyName}
-              onChange={(e) => setCompanyName(e.target.value)}
-              placeholder="e.g. Raj Traders"
-              onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
-            />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-xs">Mobile (optional)</Label>
-            <Input
-              value={mobile}
-              onChange={(e) => setMobile(e.target.value)}
-              placeholder="e.g. 9876543210"
-              onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
-            />
-          </div>
-        </div>
-        <div className="flex gap-2">
-          <Button className="flex-1" onClick={handleCreate} disabled={loading || !companyName.trim()}>
-            {loading ? 'Creating...' : 'Create Company'}
-          </Button>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-        </div>
+    <div className="space-y-1.5 mt-2">
+      <div className="text-xs text-blue-700 dark:text-blue-400 flex items-center gap-1">
+        🏦 Bill amount will be added directly to the selected bank account
       </div>
+      <Label className="text-xs">Select Bank Account *</Label>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            variant="outline"
+            role="combobox"
+            aria-expanded={open}
+            className="w-full justify-between font-normal"
+          >
+            <span className={cn(!selected && 'text-muted-foreground')}>
+              {selected ? `${selected.accountName} — ₹${selected.currentBalance.toLocaleString('en-IN')}` : 'Select bank account'}
+            </span>
+            <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
+          <Command>
+            <CommandInput placeholder="Search bank accounts..." />
+            <CommandList>
+              {options.length === 0 && (
+                <CommandEmpty>No bank accounts found. Add one in the Banks section.</CommandEmpty>
+              )}
+              <CommandGroup>
+                {options.map((b) => (
+                  <CommandItem
+                    key={b._id}
+                    value={b.accountName}
+                    onSelect={() => { onValueChange(b._id); setOpen(false) }}
+                  >
+                    <Check className={cn('mr-2 h-4 w-4', value === b._id ? 'opacity-100' : 'opacity-0')} />
+                    <span className="flex-1">{b.accountName}</span>
+                    <span className="text-xs text-muted-foreground ml-2">₹{b.currentBalance.toLocaleString('en-IN')}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            </CommandList>
+          </Command>
+        </PopoverContent>
+      </Popover>
     </div>
   )
 }
 
-// ─── Company Searchable Select (with "Add Company" fallback) ──────────────────
-
-function CompanySelect({
-  options,
-  value,
-  onValueChange,
-  onRequestAdd,
-}: {
-  options: CompanyOption[]
-  value: string
-  onValueChange: (v: string) => void
-  onRequestAdd: (name: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [search, setSearch] = useState('')
-
-  const cashbookOpt = { _id: 'cashbook', companyName: '💵 Cashbook — Local buyer, direct cash payment' }
-  const allOptions = [cashbookOpt, ...options]
-
-  const filtered = search.trim()
-    ? allOptions.filter((c) =>
-        c.companyName.toLowerCase().includes(search.toLowerCase())
-      )
-    : allOptions
-
-  const selected = allOptions.find((c) => c._id === value)
-  const showAddOption = search.trim().length > 0
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal"
-        >
-          <span className={cn(!selected && 'text-muted-foreground')}>
-            {selected?.companyName ?? 'Select company or Cashbook'}
-          </span>
-          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
-        <Command shouldFilter={false}>
-          <CommandInput
-            placeholder="Search companies..."
-            value={search}
-            onValueChange={setSearch}
-          />
-          <CommandList>
-            {filtered.length === 0 && !showAddOption && (
-              <CommandEmpty>No company found.</CommandEmpty>
-            )}
-            <CommandGroup>
-              {filtered.map((c) => (
-                <CommandItem
-                  key={c._id}
-                  value={c._id}
-                  onSelect={() => {
-                    onValueChange(c._id)
-                    setOpen(false)
-                    setSearch('')
-                  }}
-                >
-                  <Check
-                    className={cn('mr-2 h-4 w-4', value === c._id ? 'opacity-100' : 'opacity-0')}
-                  />
-                  {c.companyName}
-                </CommandItem>
-              ))}
-              {showAddOption && (
-                <CommandItem
-                  key="__add_company__"
-                  value="__add_company__"
-                  onSelect={() => {
-                    setOpen(false)
-                    onRequestAdd(search.trim())
-                    setSearch('')
-                  }}
-                  className="text-primary font-medium border-t mt-1"
-                >
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add &quot;{search.trim()}&quot; as new company
-                </CommandItem>
-              )}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-// ─── Product Searchable Select (with available qty) ───────────────────────────
-
-function ProductSelect({
-  options,
-  value,
-  onValueChange,
-}: {
-  options: ProductOption[]
-  value: string
-  onValueChange: (v: string, label: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [search, setSearch] = useState('')
-
-  const filtered = search.trim()
-    ? options.filter((o) => o.label.toLowerCase().includes(search.toLowerCase()))
-    : options
-
-  const selected = options.find((o) => o.value === value)
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal min-w-[200px]"
-        >
-          <span className={cn('truncate', !selected && 'text-muted-foreground')}>
-            {selected?.label ?? 'Select product'}
-          </span>
-          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[360px] p-0"
-        align="start"
-        // Fixed height prevents the dropdown from jumping
-        style={{ maxHeight: '320px', overflowY: 'auto' }}
-      >
-        <Command shouldFilter={false}>
-          <CommandInput
-            placeholder="Search products..."
-            value={search}
-            onValueChange={setSearch}
-          />
-          <CommandList style={{ maxHeight: '260px' }}>
-            {filtered.length === 0 && (
-              <CommandEmpty>No available products found.</CommandEmpty>
-            )}
-            <CommandGroup>
-              {filtered.map((opt) => {
-                const isSelected = value === opt.value
-                return (
-                  <CommandItem
-                    key={opt.value}
-                    value={opt.value}
-                    onSelect={() => {
-                      onValueChange(opt.value, opt.label)
-                      setOpen(false)
-                      setSearch('')
-                    }}
-                    className="flex items-center justify-between gap-2"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Check className={cn('h-4 w-4 shrink-0', isSelected ? 'opacity-100' : 'opacity-0')} />
-                      <span className="truncate">{opt.label}</span>
-                    </div>
-                    <span className="text-xs text-muted-foreground whitespace-nowrap shrink-0">
-                      {opt.availableCtn} CTN · {opt.availablePcs.toLocaleString('en-IN')} PCS
-                    </span>
-                  </CommandItem>
-                )
-              })}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  )
+interface BankAccountOption {
+  _id: string
+  accountName: string
+  currentBalance: number
 }
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function NewSellBillPage() {
   const router = useRouter()
+  const listHref = useListHref('/sale-bills')
   const [companyOptions, setCompanyOptions] = useState<CompanyOption[]>([])
-  const [productOptions, setProductOptions] = useState<ProductOption[]>([])
   const [companyId, setCompanyId] = useState<string>('')
+  const [bankAccountId, setBankAccountId] = useState<string>('')
+  const [bankAccounts, setBankAccounts] = useState<BankAccountOption[]>([])
   const [billDate, setBillDate] = useState<Date>(new Date())
   const [notes, setNotes] = useState('')
   const [extraChargesStr, setExtraChargesStr] = useState('')
@@ -323,71 +136,32 @@ export default function NewSellBillPage() {
   const extraCharges = parseFloat(extraChargesStr) || 0
   const discount = parseFloat(discountStr) || 0
   const [lines, setLines] = useState<LineRow[]>([
-    { id: '1', productSource: 'china', productId: '', productName: '', availableCtn: 0, ctnSold: 0, qtyPerCtn: 0, pcsSold: 0, ratePerPcs: 0, lineTotal: 0 },
+    { id: '1', productSource: 'china', productId: '', productName: '', availableCtn: 0, availablePcs: 0, ctnSold: 0, qtyPerCtn: 0, pcsSold: 0, ratePerPcs: 0, lineTotal: 0 },
   ])
   const [saving, setSaving] = useState(false)
   const [addCompanyName, setAddCompanyName] = useState<string | null>(null)
 
   const fetchCompanies = useCallback(async () => {
-    const res = await apiGet<{ companies: CompanyOption[] }>('/api/companies?limit=200')
+    const res = await apiGet<{ companies: CompanyOption[] }>('/api/companies?basic=true')
     if (res.success) setCompanyOptions(res.data.companies)
   }, [])
 
-  const fetchProducts = useCallback(async () => {
-    const [chinaRes, indiaRes] = await Promise.all([
-      apiGet<{ products: { _id: string; productName: string; availableCtn: number; qtyPerCtn?: number }[] }>('/api/products?limit=200'),
-      apiGet<{ products: { _id: string; productName: string; availableCtn: number; qty?: number }[] }>('/api/india-products?limit=200'),
-    ])
-    const options: ProductOption[] = []
-
-    if (chinaRes.success) {
-      // Only show products with available CTN > 0
-      const available = chinaRes.data.products.filter((p) => (p.availableCtn ?? 0) > 0)
-      for (const p of available) {
-        // Fetch qty per ctn to compute available PCS
-        const qtyRes = await apiGet<{ qtyPerCtn: number }>(`/api/products/${p._id}/qty-per-ctn`).catch(() => ({ success: false as const, data: { qtyPerCtn: 0 } }))
-        const qtyPerCtn = qtyRes.success ? (qtyRes.data.qtyPerCtn ?? 0) : 0
-        options.push({
-          value: `china:${p._id}`,
-          label: `${p.productName} 🇨🇳 China`,
-          availableCtn: p.availableCtn,
-          availablePcs: Math.round(p.availableCtn * qtyPerCtn),
-          qtyPerCtn,
-        })
-      }
+  const fetchBankAccounts = useCallback(async () => {
+    const res = await apiGet<{ accounts: BankAccountOption[] }>('/api/banks')
+    if (res.success) {
+      setBankAccounts(res.data.accounts.filter((a: BankAccountOption & { type?: string }) => (a as { type?: string }).type === 'online'))
     }
-
-    if (indiaRes.success && (indiaRes.data as { products?: unknown[] }).products) {
-      const indiaProds = (indiaRes.data as { products: { _id: string; productName: string; availableCtn: number; qty?: number }[] }).products
-      const availableIndia = indiaProds.filter((p) => (p.availableCtn ?? 0) > 0)
-      for (const p of availableIndia) {
-        const qtyRes = await apiGet<{ qtyPerCtn: number }>(`/api/india-products/${p._id}/qty-per-ctn`).catch(() => ({ success: false as const, data: { qtyPerCtn: 0 } }))
-        const qtyPerCtn = qtyRes.success ? (qtyRes.data.qtyPerCtn ?? 0) : 0
-        options.push({
-          value: `india:${p._id}`,
-          label: `${p.productName} 🇮🇳 India`,
-          availableCtn: p.availableCtn,
-          availablePcs: Math.round(p.availableCtn * qtyPerCtn),
-          qtyPerCtn,
-        })
-      }
-    }
-
-    setProductOptions(options)
   }, [])
 
   useEffect(() => {
     fetchCompanies()
-    fetchProducts()
-  }, [fetchCompanies, fetchProducts])
+    fetchBankAccounts()
+  }, [fetchCompanies, fetchBankAccounts])
 
-  function setLineProduct(id: string, compositeValue: string, productName: string) {
+  function setLineProduct(id: string, compositeValue: string, productName: string, qtyPerCtn: number, availableCtn: number, availablePcs: number) {
     const isIndia = compositeValue.startsWith('india:')
     const source: 'china' | 'india' = isIndia ? 'india' : 'china'
     const productId = compositeValue.includes(':') ? compositeValue.slice(compositeValue.indexOf(':') + 1) : compositeValue
-
-    // Get cached stock info from productOptions
-    const opt = productOptions.find((o) => o.value === compositeValue)
 
     setLines((prev) =>
       prev.map((r) =>
@@ -397,8 +171,9 @@ export default function NewSellBillPage() {
               productSource: source,
               productId,
               productName,
-              availableCtn: opt?.availableCtn ?? 0,
-              qtyPerCtn: opt?.qtyPerCtn ?? 0,
+              availableCtn,
+              availablePcs,
+              qtyPerCtn,
               ctnSold: 0,
               pcsSold: 0,
               lineTotal: 0,
@@ -411,7 +186,7 @@ export default function NewSellBillPage() {
   function addLine() {
     setLines((prev) => [
       ...prev,
-      { id: String(Date.now()), productSource: 'china', productId: '', productName: '', availableCtn: 0, ctnSold: 0, qtyPerCtn: 0, pcsSold: 0, ratePerPcs: 0, lineTotal: 0 },
+      { id: String(Date.now()), productSource: 'china', productId: '', productName: '', availableCtn: 0, availablePcs: 0, ctnSold: 0, qtyPerCtn: 0, pcsSold: 0, ratePerPcs: 0, lineTotal: 0 },
     ])
   }
 
@@ -447,14 +222,15 @@ export default function NewSellBillPage() {
 
   const subtotal = lines.reduce((s, r) => s + r.lineTotal, 0)
   const grandTotal = calcGrandTotal(subtotal, extraCharges, discount)
-  const canSave = companyId && lines.some((r) => r.productId && r.pcsSold > 0 && r.ratePerPcs >= 0)
+  const isBankSale = companyId === 'bankaccount'
+  const canSave = companyId && (!isBankSale || bankAccountId) && lines.some((r) => r.productId && r.pcsSold > 0 && r.ratePerPcs >= 0)
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!canSave) return
     const availablePcsByLine = lines.filter((r) => r.productId && r.pcsSold > 0).map((r) => ({
       id: r.id,
-      availablePcs: r.availableCtn * r.qtyPerCtn,
+      availablePcs: r.availablePcs,
       pcs: r.pcsSold,
       productName: r.productName,
     }))
@@ -466,6 +242,7 @@ export default function NewSellBillPage() {
     setSaving(true)
     const payload = {
       companyId,
+      bankAccountId: isBankSale ? bankAccountId : undefined,
       billDate: format(billDate, 'yyyy-MM-dd'),
       notes: notes.trim() || undefined,
       extraCharges,
@@ -492,7 +269,7 @@ export default function NewSellBillPage() {
         title="New Sale Bill"
         breadcrumb={
           <>
-            <Link href="/sale-bills" className="text-muted-foreground hover:text-foreground">
+            <Link href={listHref} className="text-muted-foreground hover:text-foreground">
               Sale Bills
             </Link>
             <span className="text-muted-foreground"> / New</span>
@@ -521,13 +298,20 @@ export default function NewSellBillPage() {
               <CompanySelect
                 options={companyOptions}
                 value={companyId}
-                onValueChange={setCompanyId}
+                onValueChange={(v) => { setCompanyId(v); if (v !== 'bankaccount') setBankAccountId('') }}
                 onRequestAdd={(name) => setAddCompanyName(name)}
               />
               {companyId === 'cashbook' && (
                 <div className="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded p-2 text-xs text-green-700 dark:text-green-400 flex items-center gap-1 mt-1">
                   💵 Bill amount will be added directly to Cash balance
                 </div>
+              )}
+              {isBankSale && (
+                <BankAccountSelect
+                  options={bankAccounts}
+                  value={bankAccountId}
+                  onValueChange={setBankAccountId}
+                />
               )}
             </div>
             <div className="space-y-2">
@@ -576,6 +360,12 @@ export default function NewSellBillPage() {
               <span>Grand Total</span>
               <AmountDisplay amount={Math.round(grandTotal * 100) / 100} />
             </div>
+            {grandTotal < 0 && (
+              <p className="text-xs text-destructive">
+                Discount is more than the items — ₹{Math.abs(Math.round(grandTotal * 100) / 100).toLocaleString('en-IN')} will be
+                deducted from the selected company / cashbook / bank.
+              </p>
+            )}
           </div>
         </div>
 
@@ -606,13 +396,13 @@ export default function NewSellBillPage() {
                       {/* Fixed height container prevents row from jumping */}
                       <div className="min-h-[56px]">
                         <ProductSelect
-                          options={productOptions}
                           value={row.productId ? `${row.productSource}:${row.productId}` : ''}
-                          onValueChange={(v, label) => setLineProduct(row.id, v, label)}
+                          selectedLabel={row.productName}
+                          onValueChange={(v, label, qtyPerCtn, availableCtn, availablePcs) => setLineProduct(row.id, v, label, qtyPerCtn, availableCtn, availablePcs)}
                         />
                         {row.productId && (
                           <p className="text-xs text-muted-foreground mt-1">
-                            Available: {row.availableCtn} CTN ({Math.round(row.availableCtn * row.qtyPerCtn).toLocaleString('en-IN')} pcs)
+                            Available: {row.availableCtn} CTN ({row.availablePcs.toLocaleString('en-IN')} pcs)
                           </p>
                         )}
                       </div>
@@ -726,7 +516,7 @@ export default function NewSellBillPage() {
             {saving ? 'Saving...' : 'Save Bill'}
           </Button>
           <Button type="button" variant="outline" asChild>
-            <Link href="/sale-bills">Cancel</Link>
+            <Link href={listHref}>Cancel</Link>
           </Button>
         </div>
       </form>

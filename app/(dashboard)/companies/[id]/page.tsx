@@ -18,6 +18,7 @@ import { toast } from 'sonner'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { format } from 'date-fns'
 import { cn, generateOutstandingFileName } from '@/lib/utils'
+import { useListHref } from '@/hooks/useUrlFilters'
 
 interface SellingRow {
   _id: string
@@ -52,6 +53,7 @@ interface CompanyDetailData {
     address?: string
     city?: string
     primaryMobile?: string
+  excludeFromRevenue?: boolean
     openingBalance?: number
     openingBalanceNotes?: string
     lastWhatsappSentAt?: string
@@ -67,6 +69,7 @@ interface CompanyDetailData {
 export default function CompanyDetailPage() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/companies')
   const id = params?.id as string
   const [data, setData] = useState<CompanyDetailData | null>(null)
   const [loading, setLoading] = useState(true)
@@ -74,6 +77,7 @@ export default function CompanyDetailPage() {
   const [paymentDialogOpen, setPaymentDialogOpen] = useState(false)
   const [editingPayment, setEditingPayment] = useState<PaymentFormValues | null>(null)
   const [downloadingOutstanding, setDownloadingOutstanding] = useState(false)
+  const [downloadingFullOutstanding, setDownloadingFullOutstanding] = useState(false)
   const [sendingOutstanding, setSendingOutstanding] = useState(false)
   const [sendPdfOpen, setSendPdfOpen] = useState(false)
   const [sendPdfPhone, setSendPdfPhone] = useState('')
@@ -139,6 +143,29 @@ export default function CompanyDetailPage() {
       .finally(() => setDownloadingOutstanding(false))
   }
 
+  function handleDownloadFullOutstanding() {
+    setDownloadingFullOutstanding(true)
+    fetch(`/api/companies/${id}/outstanding-pdf?full=true`, { headers: authHeaders() })
+      .then(async (res) => {
+        if (!res.ok) throw new Error('Failed to generate full outstanding PDF')
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = generateOutstandingFileName(company.companyName, 'full')
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        toast.success('Full outstanding statement downloaded')
+      })
+      .catch((err) => {
+        console.error(err)
+        toast.error('Failed to download full outstanding statement')
+      })
+      .finally(() => setDownloadingFullOutstanding(false))
+  }
+
   async function handleSendPdfOnWhatsApp() {
     const phone = sendPdfPhone.trim()
     if (!phone) {
@@ -197,7 +224,7 @@ export default function CompanyDetailPage() {
         }
         breadcrumb={
           <>
-            <Link href="/companies" className="text-muted-foreground hover:text-foreground">
+            <Link href={listHref} className="text-muted-foreground hover:text-foreground">
               Companies
             </Link>
             <span className="text-muted-foreground"> / </span>
@@ -215,6 +242,16 @@ export default function CompanyDetailPage() {
             >
               <Download className="mr-2 h-4 w-4" />
               {downloadingOutstanding ? 'Downloading...' : 'Download Outstanding'}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleDownloadFullOutstanding}
+              disabled={downloadingFullOutstanding}
+            >
+              <Download className="mr-2 h-4 w-4" />
+              {downloadingFullOutstanding ? 'Downloading...' : 'Download Full Outstanding'}
             </Button>
             <Button
               type="button"
@@ -478,6 +515,7 @@ export default function CompanyDetailPage() {
           primaryMobile: company.primaryMobile,
           openingBalance: company.openingBalance,
           openingBalanceNotes: company.openingBalanceNotes,
+          excludeFromRevenue: company.excludeFromRevenue,
         }}
       />
     </div>

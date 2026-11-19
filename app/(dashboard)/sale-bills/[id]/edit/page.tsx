@@ -18,6 +18,130 @@ import { apiGet, apiPut } from '@/lib/api-client'
 import { toast } from 'sonner'
 import { cn, calcGrandTotal } from '@/lib/utils'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
+import { Check, ChevronsUpDown } from 'lucide-react'
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command'
+import { useListHref } from '@/hooks/useUrlFilters'
+
+interface ProductOption {
+  value: string
+  label: string
+  availableCtn: number
+  availablePcs: number
+  qtyPerCtn: number
+}
+
+type ProductSelectCallback = (
+  value: string,
+  label: string,
+  qtyPerCtn: number,
+  availableCtn: number,
+  /** True stock in pcs, summed per batch. Never re-derive it as availableCtn × qtyPerCtn — batches can have different carton sizes. */
+  availablePcs: number
+) => void
+
+function ProductSelect({
+  value,
+  selectedLabel,
+  onValueChange,
+}: {
+  value: string
+  selectedLabel: string
+  onValueChange: ProductSelectCallback
+}) {
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const [options, setOptions] = useState<ProductOption[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    const delay = search.trim() ? 300 : 0
+    const timer = setTimeout(async () => {
+      setLoading(true)
+      const url = search.trim()
+        ? `/api/sell-bills/product-options?search=${encodeURIComponent(search.trim())}`
+        : '/api/sell-bills/product-options'
+      const res = await apiGet<{ products: ProductOption[] }>(url)
+      if (res.success) setOptions(res.data.products)
+      setLoading(false)
+    }, delay)
+    return () => clearTimeout(timer)
+  }, [open, search])
+
+  function handleOpenChange(o: boolean) {
+    setOpen(o)
+    if (o) setSearch('')
+  }
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          className="w-full justify-between font-normal min-w-[180px]"
+        >
+          <span className={cn('truncate', !value && 'text-muted-foreground')}>
+            {value ? (selectedLabel || value) : 'Select product'}
+          </span>
+          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[360px] p-0" align="start" style={{ maxHeight: '320px', overflowY: 'auto' }}>
+        <Command shouldFilter={false}>
+          <CommandInput
+            placeholder="Type to search products..."
+            value={search}
+            onValueChange={setSearch}
+          />
+          <CommandList style={{ maxHeight: '260px' }}>
+            {loading && (
+              <div className="py-3 text-center text-sm text-muted-foreground">Loading...</div>
+            )}
+            {!loading && options.length === 0 && (
+              <CommandEmpty>No available products found.</CommandEmpty>
+            )}
+            {!loading && options.length > 0 && (
+              <CommandGroup>
+                {options.map((opt) => {
+                  const isSelected = value === opt.value
+                  return (
+                    <CommandItem
+                      key={opt.value}
+                      value={opt.value}
+                      onSelect={() => {
+                        onValueChange(opt.value, opt.label, opt.qtyPerCtn, opt.availableCtn, opt.availablePcs)
+                        setOpen(false)
+                        setSearch('')
+                      }}
+                      className="flex items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Check className={cn('h-4 w-4 shrink-0', isSelected ? 'opacity-100' : 'opacity-0')} />
+                        <span className="truncate">{opt.label}</span>
+                      </div>
+                      <span className="text-xs text-muted-foreground whitespace-nowrap shrink-0">
+                        {opt.availableCtn} CTN · {opt.availablePcs.toLocaleString('en-IN')} PCS
+                      </span>
+                    </CommandItem>
+                  )
+                })}
+              </CommandGroup>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  )
+}
 
 interface LineRow {
   id: string
@@ -36,15 +160,25 @@ interface LineRow {
   lineTotal: number
 }
 
+interface BankAccountOption {
+  _id: string
+  accountName: string
+  currentBalance: number
+}
+
 export default function EditSellBillPage() {
   const router = useRouter()
+  const listHref = useListHref('/sale-bills')
   const params = useParams()
   const id = params?.id as string
   const [companyOptions, setCompanyOptions] = useState<SearchableSelectOption<string>[]>([])
-  const [productOptions, setProductOptions] = useState<SearchableSelectOption<string>[]>([])
   const [loading, setLoading] = useState(true)
   const [companyId, setCompanyId] = useState<string>('')
   const [existingBillIsCashbook, setExistingBillIsCashbook] = useState(false)
+  const [existingBillIsBankSale, setExistingBillIsBankSale] = useState(false)
+  const [bankAccountId, setBankAccountId] = useState<string>('')
+  const [bankAccountName, setBankAccountName] = useState<string>('')
+  const [bankAccounts, setBankAccounts] = useState<BankAccountOption[]>([])
   const [billDate, setBillDate] = useState<Date>(new Date())
   const [notes, setNotes] = useState('')
   const [extraChargesStr, setExtraChargesStr] = useState('')
@@ -55,8 +189,8 @@ export default function EditSellBillPage() {
   const discount = parseFloat(discountStr) || 0
   const [lines, setLines] = useState<LineRow[]>([])
   const [saving, setSaving] = useState(false)
-  /** Fresh availableCtn + qtyPerCtn per productId (from product APIs). Used so getAvailablePcsForEdit is correct when line.availableCtn is 0. */
-  const [productStock, setProductStock] = useState<Record<string, { availableCtn: number; qtyPerCtn: number }>>({})
+  /** Fresh availableCtn + availablePcs + qtyPerCtn per productId (from product APIs). Used so getAvailablePcsForEdit is correct when line.availableCtn is 0. */
+  const [productStock, setProductStock] = useState<Record<string, { availableCtn: number; availablePcs: number; qtyPerCtn: number }>>({})
 
   const fetchBill = useCallback(async () => {
     if (!id) return
@@ -77,10 +211,22 @@ export default function EditSellBillPage() {
       toast.error(res.message)
       return
     }
-    const d = res.data as { company?: { _id: string } | null; isCashbook?: boolean; billDate: string; notes?: string; extraCharges?: number; extraChargesNote?: string; discount?: number; discountNote?: string; items: { productSource?: string; product?: { _id: string }; indiaProduct?: { _id: string }; productName?: string; ctnSold: number; pcsSold: number; ratePerPcs: number }[] }
-    const isCashbook = !!d.isCashbook || !d.company
-    setCompanyId(isCashbook ? 'cashbook' : String(d.company!._id))
-    setExistingBillIsCashbook(isCashbook)
+    const d = res.data as { company?: { _id: string } | null; isCashbook?: boolean; isBankSale?: boolean; bankAccount?: { _id: string; accountName?: string } | null; companyName?: string | null; billDate: string; notes?: string; extraCharges?: number; extraChargesNote?: string; discount?: number; discountNote?: string; items: { productSource?: string; product?: { _id: string }; indiaProduct?: { _id: string }; productName?: string; ctnSold: number; pcsSold: number; ratePerPcs: number }[] }
+    const isCashbook = !!d.isCashbook
+    const isBankSale = !!d.isBankSale
+    if (isCashbook) {
+      setCompanyId('cashbook')
+      setExistingBillIsCashbook(true)
+    } else if (isBankSale) {
+      setCompanyId('bankaccount')
+      setExistingBillIsBankSale(true)
+      const baId = d.bankAccount?._id ? String(d.bankAccount._id) : ''
+      const baName = d.bankAccount?.accountName ?? d.companyName ?? 'Bank Account'
+      setBankAccountId(baId)
+      setBankAccountName(baName)
+    } else {
+      setCompanyId(d.company ? String(d.company._id) : '')
+    }
     setBillDate(new Date(d.billDate))
     setNotes(d.notes ?? '')
     setExtraChargesStr(d.extraCharges ? String(d.extraCharges) : '')
@@ -120,13 +266,13 @@ export default function EditSellBillPage() {
     lineRows.forEach((row, idx) => {
       if (row.productId) {
         fetchStockAndQty(row.productSource, row.productId).then(
-          ({ availableCtn, qtyPerCtn: fetchedQty }) => {
+          ({ availableCtn, availablePcs, qtyPerCtn: fetchedQty }) => {
             const finalQtyPerCtn =
               fetchedQty && fetchedQty > 0 ? fetchedQty : row.qtyPerCtn
 
             setProductStock((prev) => ({
               ...prev,
-              [row.productId]: { availableCtn, qtyPerCtn: finalQtyPerCtn },
+              [row.productId]: { availableCtn, availablePcs, qtyPerCtn: finalQtyPerCtn },
             }))
 
             setLines((prev) =>
@@ -143,49 +289,43 @@ export default function EditSellBillPage() {
   }, [id])
 
   const fetchCompanies = useCallback(async () => {
-    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?limit=200')
+    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?basic=true')
     if (res.success) setCompanyOptions(res.data.companies.map((c) => ({ value: c._id, label: c.companyName })))
   }, [])
-  const fetchProducts = useCallback(async () => {
-    const [chinaRes, indiaRes] = await Promise.all([
-      apiGet<{ products: { _id: string; productName: string }[] }>('/api/products?limit=200'),
-      apiGet<{ products: { _id: string; productName: string }[] }>('/api/india-products?limit=200'),
-    ])
-    const options: SearchableSelectOption<string>[] = []
-    if (chinaRes.success)
-      options.push(...chinaRes.data.products.map((p) => ({ value: `china:${p._id}`, label: `${p.productName} 🇨🇳 China` })))
-    if (indiaRes.success && 'products' in indiaRes.data)
-      options.push(...(indiaRes.data as { products: { _id: string; productName: string }[] }).products.map((p) => ({ value: `india:${p._id}`, label: `${p.productName} 🇮🇳 India` })))
-    setProductOptions(options)
+
+  const fetchBankAccounts = useCallback(async () => {
+    const res = await apiGet<{ accounts: (BankAccountOption & { type?: string })[] }>('/api/banks')
+    if (res.success) setBankAccounts(res.data.accounts.filter((a) => a.type === 'online'))
   }, [])
 
   useEffect(() => {
     fetchCompanies()
-    fetchProducts()
-  }, [fetchCompanies, fetchProducts])
+    fetchBankAccounts()
+  }, [fetchCompanies, fetchBankAccounts])
 
   useEffect(() => {
     setLoading(true)
     fetchBill().finally(() => setLoading(false))
   }, [fetchBill])
 
-  async function fetchStockAndQty(source: 'china' | 'india', productId: string): Promise<{ availableCtn: number; qtyPerCtn: number }> {
-    if (source === 'china') {
-      const [detailRes, qtyRes] = await Promise.all([
-        apiGet<{ availableCtn: number }>(`/api/products/${productId}`),
-        apiGet<{ qtyPerCtn: number }>(`/api/products/${productId}/qty-per-ctn`),
-      ])
-      const data = detailRes.success ? detailRes.data : undefined
-      const qtyData = qtyRes.success ? qtyRes.data : undefined
-      return { availableCtn: data?.availableCtn ?? 0, qtyPerCtn: qtyData?.qtyPerCtn ?? 0 }
-    }
+  async function fetchStockAndQty(source: 'china' | 'india', productId: string): Promise<{ availableCtn: number; availablePcs: number; qtyPerCtn: number }> {
+    const base = source === 'china' ? 'products' : 'india-products'
     const [detailRes, qtyRes] = await Promise.all([
-      apiGet<{ availableCtn: number }>(`/api/india-products/${productId}`),
-      apiGet<{ qtyPerCtn: number }>(`/api/india-products/${productId}/qty-per-ctn`),
+      apiGet<{ availableCtn: number; availablePcs: number; sellableCtn?: number; sellablePcs?: number }>(
+        `/api/${base}/${productId}`
+      ),
+      apiGet<{ qtyPerCtn: number }>(`/api/${base}/${productId}/qty-per-ctn`),
     ])
     const data = detailRes.success ? detailRes.data : undefined
     const qtyData = qtyRes.success ? qtyRes.data : undefined
-    return { availableCtn: data?.availableCtn ?? 0, qtyPerCtn: qtyData?.qtyPerCtn ?? 0 }
+    return {
+      // Prefer the locked-only totals: China FIFO refuses unlocked entries. India
+      // entries have no lock concept, so that route returns availableCtn/Pcs only.
+      availableCtn: data?.sellableCtn ?? data?.availableCtn ?? 0,
+      // Summed per batch by the API — correct even when batches have different carton sizes
+      availablePcs: data?.sellablePcs ?? data?.availablePcs ?? 0,
+      qtyPerCtn: qtyData?.qtyPerCtn ?? 0,
+    }
   }
 
   function addLine() {
@@ -212,27 +352,18 @@ export default function EditSellBillPage() {
     setLines((prev) => (prev.length <= 1 ? prev : prev.filter((r) => r.id !== lineId)))
   }
 
-  function setLineProduct(lineId: string, compositeValue: string, productName: string) {
+  function setLineProduct(lineId: string, compositeValue: string, productName: string, qtyPerCtn: number, availableCtn: number, availablePcs: number) {
     const isIndia = compositeValue.startsWith('india:')
     const source: 'china' | 'india' = isIndia ? 'india' : 'china'
     const productId = compositeValue.includes(':') ? compositeValue.slice(compositeValue.indexOf(':') + 1) : compositeValue
+    setProductStock((prev) => ({ ...prev, [productId]: { availableCtn, availablePcs, qtyPerCtn } }))
     setLines((prev) =>
       prev.map((r) =>
         r.id === lineId
-          ? { ...r, productSource: source, productId, productName, availableCtn: 0, originalCtn: 0, originalPcs: 0, qtyPerCtn: 0, ctnSold: 0, pcsSold: 0, lineTotal: 0 }
+          ? { ...r, productSource: source, productId, productName, availableCtn, originalCtn: 0, originalPcs: 0, qtyPerCtn, ctnSold: 0, pcsSold: 0, lineTotal: 0 }
           : r
       )
     )
-    if (productId) {
-      fetchStockAndQty(source, productId).then(({ availableCtn, qtyPerCtn }) => {
-        setProductStock((prev) => ({ ...prev, [productId]: { availableCtn, qtyPerCtn } }))
-        setLines((prev) =>
-          prev.map((r) =>
-            r.id === lineId ? { ...r, availableCtn, qtyPerCtn } : r
-          )
-        )
-      })
-    }
   }
 
   function setLineCtn(lineId: string, ctn: number) {
@@ -279,9 +410,13 @@ export default function EditSellBillPage() {
     companyId &&
     lines.some((r) => r.productId && r.pcsSold > 0 && r.ratePerPcs >= 0)
 
-  /** For edit: available PCS = in-stock PCS + this line's original PCS (already on this bill). Use productStock so we use fresh product data, not line.availableCtn which can be 0 when all sold. */
-  function getAvailablePcsForEdit(row: LineRow): number {
+  /** PCS currently in stock for this line's product, excluding anything already on this bill. Uses productStock so we read fresh product data, not line.availableCtn which can be 0 when all sold. */
+  function getInStockPcs(row: LineRow): number {
     const product = productStock[row.productId]
+    // Prefer the API's per-batch pcs total; availableCtn × qtyPerCtn is only a
+    // fallback and is wrong when batches have different carton sizes.
+    if (product?.availablePcs != null) return Math.round(product.availablePcs)
+
     const availableCtn = product?.availableCtn ?? row.availableCtn ?? 0
     const fromProduct =
       product?.qtyPerCtn && product.qtyPerCtn > 0 ? product.qtyPerCtn : null
@@ -291,15 +426,13 @@ export default function EditSellBillPage() {
         : null
     const fromRow = row.qtyPerCtn && row.qtyPerCtn > 0 ? row.qtyPerCtn : null
 
-    const qtyPerCtn =
-      fromProduct ??
-      fromOriginal ??
-      fromRow ??
-      1
+    const qtyPerCtn = fromProduct ?? fromOriginal ?? fromRow ?? 1
+    return Math.round(availableCtn * qtyPerCtn)
+  }
 
-    const inStock = Math.round(availableCtn * qtyPerCtn)
-    const onThisBill = row.originalPcs ?? 0
-    return inStock + onThisBill
+  /** For edit: available PCS = in-stock PCS + this line's original PCS (already on this bill, so editing down is always allowed). */
+  function getAvailablePcsForEdit(row: LineRow): number {
+    return getInStockPcs(row) + (row.originalPcs ?? 0)
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -316,7 +449,7 @@ export default function EditSellBillPage() {
     })
     if (over) {
       const maxPcs = getAvailablePcsForEdit(over)
-      const inStock = maxPcs - (over.originalPcs ?? 0)
+      const inStock = getInStockPcs(over)
       toast.error(
         `Only ${maxPcs} pcs available for ${over.productName || 'this product'} (${inStock} in stock + ${over.originalPcs ?? 0} on this bill).`
       )
@@ -325,6 +458,7 @@ export default function EditSellBillPage() {
     setSaving(true)
     const payload = {
       companyId,
+      bankAccountId: existingBillIsBankSale ? bankAccountId : undefined,
       billDate: format(billDate, 'yyyy-MM-dd'),
       notes: notes.trim() || undefined,
       extraCharges,
@@ -364,7 +498,7 @@ export default function EditSellBillPage() {
         title="Edit Sale Bill"
         breadcrumb={
           <>
-            <Link href="/sale-bills" className="text-muted-foreground hover:text-foreground">
+            <Link href={listHref} className="text-muted-foreground hover:text-foreground">
               Sale Bills
             </Link>
             <span className="text-muted-foreground"> / Edit</span>
@@ -377,26 +511,39 @@ export default function EditSellBillPage() {
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>Company *</Label>
-              <SearchableSelect
-                options={[
-                  { value: 'cashbook', label: '💵 Cashbook — Local buyer, direct cash payment' },
-                  ...companyOptions,
-                ]}
-                value={companyId}
-                onValueChange={setCompanyId}
-                placeholder="Select company or Cashbook"
-                searchPlaceholder="Search companies..."
-                disabled={existingBillIsCashbook}
-              />
-              {companyId === 'cashbook' && !existingBillIsCashbook && (
-                <div className="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded p-2 text-xs text-green-700 dark:text-green-400 flex items-center gap-1 mt-1">
-                  💵 Bill amount will be added directly to Cash balance
+              {existingBillIsBankSale ? (
+                <div className="space-y-1.5">
+                  <div className="flex h-9 w-full items-center rounded-md border border-input bg-muted/50 px-3 text-sm text-muted-foreground cursor-not-allowed">
+                    🏦 {bankAccountName}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    🏦 Bank account bills cannot change type
+                  </p>
                 </div>
-              )}
-              {existingBillIsCashbook && (
-                <p className="text-xs text-muted-foreground mt-1">
-                  💵 Cashbook bills cannot be changed to company bills
-                </p>
+              ) : (
+                <>
+                  <SearchableSelect
+                    options={[
+                      { value: 'cashbook', label: '💵 Cashbook — Local buyer, direct cash payment' },
+                      ...companyOptions,
+                    ]}
+                    value={companyId}
+                    onValueChange={setCompanyId}
+                    placeholder="Select company or Cashbook"
+                    searchPlaceholder="Search companies..."
+                    disabled={existingBillIsCashbook}
+                  />
+                  {companyId === 'cashbook' && !existingBillIsCashbook && (
+                    <div className="bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded p-2 text-xs text-green-700 dark:text-green-400 flex items-center gap-1 mt-1">
+                      💵 Bill amount will be added directly to Cash balance
+                    </div>
+                  )}
+                  {existingBillIsCashbook && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      💵 Cashbook bills cannot be changed to company bills
+                    </p>
+                  )}
+                </>
               )}
             </div>
             <div className="space-y-2">
@@ -444,6 +591,12 @@ export default function EditSellBillPage() {
               <span>Grand Total</span>
               <AmountDisplay amount={Math.round(grandTotal * 100) / 100} />
             </div>
+            {grandTotal < 0 && (
+              <p className="text-xs text-destructive">
+                Discount is more than the items — ₹{Math.abs(Math.round(grandTotal * 100) / 100).toLocaleString('en-IN')} will be
+                deducted from the selected company / cashbook / bank.
+              </p>
+            )}
           </div>
         </div>
 
@@ -472,22 +625,16 @@ export default function EditSellBillPage() {
                   <tr key={row.id} className="border-b">
                     <td className="p-2">
                       <div className="space-y-1">
-                        <SearchableSelect
-                          options={productOptions}
+                        <ProductSelect
                           value={row.productId ? `${row.productSource}:${row.productId}` : ''}
-                          onValueChange={(v) => {
-                            const opt = productOptions.find((o) => o.value === v)
-                            setLineProduct(row.id, v, opt?.label ?? '')
-                          }}
-                          placeholder="Select product"
-                          searchPlaceholder="Search..."
-                          className="min-w-[180px]"
+                          selectedLabel={row.productName}
+                          onValueChange={(v, label, qtyPerCtn, availableCtn, availablePcs) => setLineProduct(row.id, v, label, qtyPerCtn, availableCtn, availablePcs)}
                         />
                         {row.productId ? (
                           <p className="text-xs text-muted-foreground">
                             {row.originalCtn > 0
-                              ? `Available for edit: ${getAvailablePcsForEdit(row)} pcs (${getAvailablePcsForEdit(row) - (row.originalPcs ?? 0)} in stock + ${row.originalPcs ?? 0} on this bill)`
-                              : `Available: ${row.availableCtn} CTN (${Math.round(row.availableCtn * (row.qtyPerCtn || 1))} pcs)`}
+                              ? `Available for edit: ${getAvailablePcsForEdit(row)} pcs (${getInStockPcs(row)} in stock + ${row.originalPcs ?? 0} on this bill)`
+                              : `Available: ${row.availableCtn} CTN (${getInStockPcs(row)} pcs)`}
                           </p>
                         ) : null}
                       </div>

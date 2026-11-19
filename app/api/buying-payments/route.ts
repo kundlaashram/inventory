@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import BuyingEntry from '@/models/BuyingEntry'
 import BuyingPayment from '@/models/BuyingPayment'
 import ChinaPerson from '@/models/ChinaPerson'
@@ -69,6 +70,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     const buyingEntryId = body.buyingEntryId ?? body.buyingEntry
     const productId = body.productId ?? body.product
@@ -106,7 +115,17 @@ export async function POST(req: NextRequest) {
         { status: 400 }
       )
     }
-    const paymentDate = paymentDateRaw ? new Date(paymentDateRaw) : new Date()
+    // If client sends a date-only string (YYYY-MM-DD), preserve that calendar date
+    // but attach the current time so same-day ordering stays chronological.
+    const now = new Date()
+    const paymentDate = (() => {
+      if (!paymentDateRaw) return now
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(paymentDateRaw))) {
+        const [y, m, d] = String(paymentDateRaw).split('-').map(Number)
+        return new Date(Date.UTC(y, m - 1, d, now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds()))
+      }
+      return new Date(paymentDateRaw)
+    })()
     if (Number.isNaN(paymentDate.getTime())) {
       return NextResponse.json(
         { success: false, error: 'Validation failed', message: 'Invalid payment date' },

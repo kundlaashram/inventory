@@ -7,6 +7,8 @@ import SellBillItem from '@/models/SellBillItem'
 import SellBill from '@/models/SellBill'
 import Company from '@/models/Company'
 import mongoose from 'mongoose'
+import { ensureCanDelete, ensureNotViewer } from '@/lib/permissions'
+import { parseMeasure } from '@/lib/utils'
 
 export const dynamic = 'force-dynamic'
 
@@ -62,6 +64,46 @@ export async function GET(
                 ],
               },
             },
+            availablePcsIndia: {
+              $sum: {
+                $cond: [
+                  { $eq: ['$chinaWarehouseReceived', 'yes'] },
+                  { $multiply: ['$availableCtn', '$qty'] },
+                  0,
+                ],
+              },
+            },
+            // Locked-only totals: what processFIFO will actually let you sell.
+            // availableCtn/availablePcs above stay unfiltered so the product page
+            // keeps reporting physical stock.
+            sellableCtnIndia: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      { $eq: ['$chinaWarehouseReceived', 'yes'] },
+                      { $eq: ['$isLocked', true] },
+                    ],
+                  },
+                  '$availableCtn',
+                  0,
+                ],
+              },
+            },
+            sellablePcsIndia: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      { $eq: ['$chinaWarehouseReceived', 'yes'] },
+                      { $eq: ['$isLocked', true] },
+                    ],
+                  },
+                  { $multiply: ['$availableCtn', '$qty'] },
+                  0,
+                ],
+              },
+            },
             chinaFactoryCtn: {
               $sum: {
                 $cond: [
@@ -89,13 +131,38 @@ export async function GET(
       ]),
       SellBillItem.aggregate([
         { $match: { product: productId } },
-        { $group: { _id: null, totalProfit: { $sum: '$totalProfit' } } },
+        { $lookup: { from: 'sellbills', localField: 'sellBill', foreignField: '_id', as: 'bill' } },
+        { $unwind: '$bill' },
+        {
+          $addFields: {
+            itemCost: {
+              $reduce: {
+                input: { $ifNull: ['$fifoBreakdown', []] },
+                initialValue: 0,
+                in: { $add: ['$$value', { $multiply: ['$$this.finalCost', '$$this.pcsConsumed'] }] },
+              },
+            },
+            adjustedRevenue: {
+              $cond: [
+                { $gt: ['$bill.totalAmount', 0] },
+                { $multiply: ['$totalAmount', { $divide: [{ $ifNull: ['$bill.grandTotal', '$bill.totalAmount'] }, '$bill.totalAmount'] }] },
+                '$totalAmount',
+              ],
+            },
+          },
+        },
+        { $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } } },
+        { $group: { _id: null, totalProfit: { $sum: '$adjustedProfit' } } },
       ]),
       SellBillItem.find({ product: productId })
         .sort({ createdAt: -1 })
         .populate({
           path: 'sellBill',
-          populate: { path: 'company', select: 'companyName' },
+          select: 'billNumber billDate company companyName isCashbook isBankSale bankAccount',
+          populate: [
+            { path: 'company', select: 'companyName' },
+            { path: 'bankAccount', select: 'accountName' },
+          ],
         })
         .lean(),
     ])
@@ -104,6 +171,9 @@ export async function GET(
       entryStats[0] ?? {
         totalCtn: 0,
         availableCtnIndia: 0,
+        availablePcsIndia: 0,
+        sellableCtnIndia: 0,
+        sellablePcsIndia: 0,
         inTransitCtn: 0,
         chinaFactoryCtn: 0,
         chinaWhCtn: 0,
@@ -115,6 +185,9 @@ export async function GET(
     const totalCtn = stats.totalCtn ?? 0
     // Round to 2dp to eliminate floating-point residuals from FIFO division
     const availableCtn = Math.round((stats.availableCtnIndia ?? 0) * 100) / 100
+    const availablePcs = Math.round((stats.availablePcsIndia ?? 0) * 100) / 100
+    const sellableCtn = Math.round((stats.sellableCtnIndia ?? 0) * 100) / 100
+    const sellablePcs = Math.round((stats.sellablePcsIndia ?? 0) * 100) / 100
     const totalSoldCtn = Math.round((stats.soldCtn ?? 0) * 100) / 100
     const inTransitCtn = stats.inTransitCtn ?? 0
     const chinaFactoryCtn = stats.chinaFactoryCtn ?? 0
@@ -126,7 +199,7 @@ export async function GET(
     const sellingHistoryList = sellingHistory
       .filter((item) => item.sellBill && typeof item.sellBill === 'object')
       .map((item) => {
-        const sellBill = item.sellBill as unknown as { _id: mongoose.Types.ObjectId; billNumber: number; billDate: Date; company: { _id: mongoose.Types.ObjectId; companyName: string } }
+        const sellBill = item.sellBill as unknown as { _id: mongoose.Types.ObjectId; billNumber: number; billDate: Date; company: { _id: mongoose.Types.ObjectId; companyName: string }; isCashbook: boolean; isBankSale: boolean; companyName?: string; bankAccount?: { _id: mongoose.Types.ObjectId; accountName: string } }
         const breakdown = (item.fifoBreakdown ?? []) as {
           buyingEntry: mongoose.Types.ObjectId
           ctnConsumed: number
@@ -146,8 +219,14 @@ export async function GET(
           sellBillId: sellBill._id,
           billNumber: sellBill.billNumber,
           billDate: sellBill.billDate,
-          companyId: sellBill.company?._id,
-          companyName: sellBill.company?.companyName ?? '—',
+          isCashbook: !!sellBill.isCashbook,
+          isBankSale: !!sellBill.isBankSale,
+          companyId: sellBill.isCashbook || sellBill.isBankSale ? undefined : sellBill.company?._id,
+          companyName: sellBill.isCashbook
+            ? 'Cashbook'
+            : sellBill.isBankSale
+            ? (sellBill.bankAccount?.accountName ?? sellBill.companyName ?? 'Bank Account')
+            : (sellBill.company?.companyName ?? '—'),
           ctnSold: item.ctnSold,
           pcsSold: item.pcsSold,
           ratePerPcs: item.ratePerPcs,
@@ -168,6 +247,9 @@ export async function GET(
         buyingEntriesCount: stats.count,
         totalCtn,
         availableCtn,
+        availablePcs,
+        sellableCtn,
+        sellablePcs,
         totalSoldCtn,
         chinaWhCtn,
         inTransitCtn,
@@ -203,6 +285,14 @@ export async function PUT(
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -221,6 +311,8 @@ export async function PUT(
         ...(body.productName != null && { productName: String(body.productName).trim() }),
         ...(body.productDescription !== undefined && { productDescription: body.productDescription?.trim() || undefined }),
         ...(body.productImage !== undefined && { productImage: body.productImage || undefined }),
+        ...(body.ctnWeightKg !== undefined && { ctnWeightKg: parseMeasure(body.ctnWeightKg) }),
+        ...(body.ctnCbm !== undefined && { ctnCbm: parseMeasure(body.ctnCbm) }),
         updatedBy,
       },
       { new: true, runValidators: true }
@@ -259,6 +351,14 @@ export async function DELETE(
         { status: 401 }
       )
     }
+    const perm = ensureCanDelete(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(

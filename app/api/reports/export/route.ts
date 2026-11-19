@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/auth'
 import * as XLSX from 'xlsx'
 import React from 'react'
-import { renderToBuffer } from '@react-pdf/renderer'
+import { renderToBuffer, DocumentProps } from '@react-pdf/renderer'
 import { PnlPdfDocument, StockPdfDocument, SellingPdfDocument, BuyingPdfDocument } from '@/lib/report-pdf'
 import { format } from 'date-fns'
 
@@ -33,12 +33,16 @@ export async function GET(req: NextRequest) {
     const startDate = searchParams.get('startDate')?.trim() ?? ''
     const endDate = searchParams.get('endDate')?.trim() ?? ''
     const withExpenses = searchParams.get('withExpenses') === 'true'
+    const availableOnly = searchParams.get('availableOnly') === 'true'
 
+    const archive = searchParams.get('archive')?.trim() ?? ''
     const params = new URLSearchParams()
     params.set('period', period)
+    if (archive) params.set('archive', archive)
     if (startDate) params.set('startDate', startDate)
     if (endDate) params.set('endDate', endDate)
     if (reportType === 'pnl') params.set('withExpenses', String(withExpenses))
+    if (searchParams.get('includeExcluded') === '1') params.set('includeExcluded', '1')
 
     const origin = new URL(req.url).origin
     const auth = req.headers.get('authorization') ?? ''
@@ -51,7 +55,33 @@ export async function GET(req: NextRequest) {
         { status: 502 }
       )
     }
-    const data = json.data as unknown
+    let data = json.data as unknown
+
+    // Apply available-only filter for stock exports
+    if (reportType === 'stock' && availableOnly) {
+      type StockRow = { availableCtn: number; totalCost?: number; availablePcs?: number; [key: string]: unknown }
+      type StockData = {
+        summary: Record<string, unknown>
+        rows: StockRow[]
+        indiaRows?: StockRow[]
+      }
+      const d = data as StockData
+      d.rows = d.rows.filter((r) => r.availableCtn > 0)
+      if (d.indiaRows) d.indiaRows = d.indiaRows.filter((r) => r.availableCtn > 0)
+      const chinaStockCost = Number(d.rows.reduce((s, r) => s + (r.totalCost ?? 0), 0).toFixed(2))
+      const indiaStockCost = Number((d.indiaRows ?? []).reduce((s, r) => s + (r.totalCost ?? 0), 0).toFixed(2))
+      d.summary = {
+        ...d.summary,
+        totalProducts: d.rows.length,
+        totalStockCost: chinaStockCost,
+        totalIndiaProducts: d.indiaRows?.length ?? 0,
+        totalIndiaStockCost: indiaStockCost,
+        totalAvailablePcs: d.rows.reduce((s, r) => s + (r.availablePcs ?? 0), 0),
+        totalIndiaAvailablePcs: (d.indiaRows ?? []).reduce((s, r) => s + (r.availablePcs ?? 0), 0),
+        totalIndiaAvailableCtn: (d.indiaRows ?? []).reduce((s, r) => s + r.availableCtn, 0),
+      }
+      data = d
+    }
 
     if (formatType === 'pdf') {
       // Basic data presence check so we fail fast with a clear error instead of React's minified #130.
@@ -134,7 +164,8 @@ export async function GET(req: NextRequest) {
       }
 
       try {
-        const buffer = await renderToBuffer(doc)
+        const pdfBuffer = await renderToBuffer(doc as React.ReactElement<DocumentProps>)
+        const buffer = new Uint8Array(pdfBuffer)
         const filename = `report-${reportType}-${format(new Date(), 'yyyy-MM-dd')}.pdf`
         return new NextResponse(buffer, {
           headers: {

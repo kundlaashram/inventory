@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { format } from 'date-fns'
@@ -17,6 +17,7 @@ import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { cn } from '@/lib/utils'
 import { ExportPdfButton } from '@/components/ui/ExportPdfButton'
 import { exportTableToPdf } from '@/lib/exportPdf'
+import { useUrlParams, useSyncUrlParams, useOnFiltersChange, useListHref } from '@/hooks/useUrlFilters'
 
 interface TransactionRow {
   _id: string
@@ -45,12 +46,17 @@ interface PageData {
   pagination: { page: number; limit: number; total: number; pages: number }
 }
 
-export default function JackDetailPage() {
+function JackDetailPageContent() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/sophia')
   const id = typeof params.id === 'string' ? params.id : ''
   const [data, setData] = useState<PageData | null>(null)
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [page, setPage] = useState(() => url.int('page', 1))
+  const [typeFilter, setTypeFilter] = useState<'all' | 'pay_in' | 'pay_out'>(() =>
+    url.oneOf('type', ['all', 'pay_in', 'pay_out'], 'all')
+  )
   const [loading, setLoading] = useState(true)
   const [payDialogOpen, setPayDialogOpen] = useState(false)
   const [payMode, setPayMode] = useState<'pay_in' | 'pay_out'>('pay_in')
@@ -59,18 +65,27 @@ export default function JackDetailPage() {
   const fetchData = useCallback(async () => {
     if (!id) return
     setLoading(true)
-    const result = await apiGet<PageData>(`/api/sophia/${id}/transactions?page=${page}&limit=20`)
+    const params = new URLSearchParams({ page: String(page), limit: '20' })
+    if (typeFilter !== 'all') params.set('type', typeFilter)
+    const result = await apiGet<PageData>(`/api/sophia/${id}/transactions?${params}`)
     setLoading(false)
     if (result.success) setData(result.data)
     else {
       toast.error(result.message)
       router.push('/sophia')
     }
-  }, [id, page, router])
+  }, [id, page, typeFilter, router])
 
   useEffect(() => {
     fetchData()
   }, [fetchData])
+
+  useOnFiltersChange([typeFilter], () => setPage(1))
+
+  useSyncUrlParams({
+    type: typeFilter !== 'all' ? typeFilter : undefined,
+    page: page > 1 ? page : undefined,
+  })
 
   async function handleDeleteTx(tx: TransactionRow) {
     const result = await apiDelete(`/api/sophia/transactions/${tx._id}`)
@@ -117,8 +132,10 @@ export default function JackDetailPage() {
   async function handleExportAll() {
     try {
       setExportingAll(true)
+      const exportParams = new URLSearchParams({ page: '1', limit: '20', exportAll: '1' })
+      if (typeFilter !== 'all') exportParams.set('type', typeFilter)
       const result = await apiGet<PageData>(
-        `/api/sophia/${id}/transactions?page=1&limit=20&exportAll=1`
+        `/api/sophia/${id}/transactions?${exportParams}`
       )
       if (!result.success) {
         toast.error(result.message)
@@ -147,7 +164,7 @@ export default function JackDetailPage() {
     <div className="space-y-6">
       <PageHeader
         breadcrumb={
-          <Link href="/sophia" className="text-muted-foreground hover:text-foreground flex items-center gap-1">
+          <Link href={listHref} className="text-muted-foreground hover:text-foreground flex items-center gap-1">
             <ArrowLeft className="h-4 w-4" />
             Sophia
           </Link>
@@ -207,6 +224,24 @@ export default function JackDetailPage() {
         </p>
         {isNegative && (
           <p className="mt-1 text-sm font-medium text-destructive">Negative balance</p>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        {(['all', 'pay_in', 'pay_out'] as const).map((f) => (
+          <Button
+            key={f}
+            size="sm"
+            variant={typeFilter === f ? 'default' : 'outline'}
+            onClick={() => setTypeFilter(f)}
+          >
+            {f === 'all' ? 'All' : f === 'pay_in' ? 'Pay In' : 'Pay Out'}
+          </Button>
+        ))}
+        {typeFilter !== 'all' && data && (
+          <span className="text-sm text-muted-foreground ml-2">
+            {data.pagination.total} transaction{data.pagination.total !== 1 ? 's' : ''}
+          </span>
         )}
       </div>
 
@@ -349,5 +384,13 @@ export default function JackDetailPage() {
         />
       )}
     </div>
+  )
+}
+
+export default function JackDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <JackDetailPageContent />
+    </Suspense>
   )
 }

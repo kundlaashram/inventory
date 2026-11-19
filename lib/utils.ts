@@ -31,16 +31,21 @@ export function formatBillNumber(
   return `INV-${padded}`
 }
 
-/** Grand total = subtotal + extraCharges - discount. Use for all sell bill balance logic. */
+/**
+ * Grand total = subtotal + extraCharges - discount. Use for all sell bill balance logic.
+ * Deliberately not floored at 0: when the discount is larger than the line items the bill
+ * is genuinely negative (money owed back to the buyer) and must reduce the cashbook, bank
+ * account or company outstanding by that amount.
+ */
 export function calcGrandTotal(
   totalAmount: number,
   extraCharges: number = 0,
   discount: number = 0
 ): number {
-  return parseFloat(Math.max(0, totalAmount + extraCharges - discount).toFixed(2))
+  return parseFloat((totalAmount + extraCharges - discount).toFixed(2))
 }
 
-export function generateOutstandingFileName(companyNameInput: string): string {
+export function generateOutstandingFileName(companyNameInput: string, suffix?: string): string {
   const base = (companyNameInput || 'OUTSTANDING').trim().toUpperCase()
   const companyName =
     base
@@ -48,6 +53,14 @@ export function generateOutstandingFileName(companyNameInput: string): string {
       .replace(/[^A-Z0-9_]/g, '') || 'OUTSTANDING'
 
   const date = format(new Date(), 'dd-MM-yyyy')
+  const label = suffix ? `OUTSTANDING_${suffix.toUpperCase()}` : 'OUTSTANDING'
 
-  return `${companyName}_OUTSTANDING_${date}.pdf`
+  return `${companyName}_${label}_${date}.pdf`
+}
+
+/** Optional positive number from a request body; '' / null / 0 clears it. */
+export function parseMeasure(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : null
 }

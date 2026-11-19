@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { format } from 'date-fns'
@@ -19,6 +19,7 @@ import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'
 import { ExportPdfButton } from '@/components/ui/ExportPdfButton'
 import { exportTableToPdf } from '@/lib/exportPdf'
+import { useUrlParams, useSyncUrlParams, useOnFiltersChange, dateRangeParams, useListHref } from '@/hooks/useUrlFilters'
 
 interface BankTransactionRow {
   _id: string
@@ -44,18 +45,23 @@ interface PageData {
   pagination: { page: number; limit: number; total: number; pages: number }
 }
 
-export default function BankAccountHistoryPage() {
+function BankAccountHistoryPageContent() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/banks')
   const id = typeof params.id === 'string' ? params.id : ''
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
+  const [page, setPage] = useState(() => url.int('page', 1))
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<PageData | null>(null)
-  const [search, setSearch] = useState('')
+  const [search, setSearch] = useState(() => url.str('search'))
   const debouncedSearch = useDebounce(search, 400)
   const [deletingTxId, setDeletingTxId] = useState<string | null>(null)
   const [exportingAll, setExportingAll] = useState(false)
+  const [typeFilter, setTypeFilter] = useState<'all' | 'credit' | 'debit'>(() =>
+    url.oneOf('type', ['all', 'credit', 'debit'], 'all')
+  )
 
   const fetchData = useCallback(async () => {
     if (!id) return
@@ -66,6 +72,7 @@ export default function BankAccountHistoryPage() {
     if (dateRange?.from) params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
     if (dateRange?.to) params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
     if (debouncedSearch) params.set('search', debouncedSearch)
+    if (typeFilter !== 'all') params.set('type', typeFilter)
     const result = await apiGet<PageData>(`/api/banks/${id}/transactions?${params}`)
     setLoading(false)
     if (result.success) setData(result.data)
@@ -74,7 +81,16 @@ export default function BankAccountHistoryPage() {
       if (result.error === 'Not found' || (result as { message?: string }).message?.toLowerCase().includes('not found'))
         router.push('/banks')
     }
-  }, [id, page, dateRange?.from, dateRange?.to, debouncedSearch, router])
+  }, [id, page, dateRange?.from, dateRange?.to, debouncedSearch, typeFilter, router])
+
+  useOnFiltersChange([typeFilter, debouncedSearch, dateRange], () => setPage(1))
+
+  useSyncUrlParams({
+    search: debouncedSearch.trim(),
+    type: typeFilter !== 'all' ? typeFilter : undefined,
+    ...dateRangeParams(dateRange),
+    page: page > 1 ? page : undefined,
+  })
 
   useEffect(() => {
     fetchData()
@@ -112,12 +128,13 @@ export default function BankAccountHistoryPage() {
   const { account, transactions, pagination } = data
   const isNegative = account.currentBalance < 0
 
-  const pdfColumns = ['Date', 'Description', 'Debit (₹)', 'Credit (₹)', 'Balance (₹)']
+  const pdfColumns = ['Date', 'Description', 'Notes', 'Debit (₹)', 'Credit (₹)', 'Balance (₹)']
 
   const mapRows = (rows: BankTransactionRow[]) =>
     rows.map((t) => [
       format(new Date(t.transactionDate), 'dd MMM yyyy'),
       t.sourceLabel ?? t.source,
+      t.notes ?? '',
       t.type === 'debit' ? t.amount : '',
       t.type === 'credit' ? t.amount : '',
       t.runningBalance ?? t.balanceAfter,
@@ -133,6 +150,7 @@ export default function BankAccountHistoryPage() {
       if (dateRange?.from) params.set('startDate', format(dateRange.from, 'yyyy-MM-dd'))
       if (dateRange?.to) params.set('endDate', format(dateRange.to, 'yyyy-MM-dd'))
       if (debouncedSearch) params.set('search', debouncedSearch)
+      if (typeFilter !== 'all') params.set('type', typeFilter)
       const result = await apiGet<PageData>(
         `/api/banks/${id}/transactions?${params.toString()}`
       )
@@ -164,7 +182,7 @@ export default function BankAccountHistoryPage() {
         title={
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="icon" asChild>
-              <Link href="/banks">
+              <Link href={listHref}>
                 <ArrowLeft className="h-4 w-4" />
               </Link>
             </Button>
@@ -178,12 +196,27 @@ export default function BankAccountHistoryPage() {
       />
 
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <DateRangePicker
-          value={dateRange}
-          onChange={setDateRange}
-          placeholder="Filter by date range"
-          className="w-full sm:w-auto"
-        />
+        <div className="flex flex-wrap items-center gap-3">
+          <DateRangePicker
+            value={dateRange}
+            onChange={setDateRange}
+            placeholder="Filter by date range"
+            className="w-full sm:w-auto"
+          />
+          <div className="flex gap-1 rounded-md border p-0.5 bg-muted/40">
+            {(['all', 'credit', 'debit'] as const).map((t) => (
+              <Button
+                key={t}
+                variant={typeFilter === t ? 'default' : 'ghost'}
+                size="sm"
+                className="h-7 text-xs capitalize"
+                onClick={() => setTypeFilter(t)}
+              >
+                {t === 'credit' ? '↑ Credit' : t === 'debit' ? '↓ Debit' : 'All'}
+              </Button>
+            ))}
+          </div>
+        </div>
         <div className="flex flex-wrap gap-2">
           <Input
             placeholder="Search transactions..."
@@ -234,7 +267,19 @@ export default function BankAccountHistoryPage() {
                 <tr key={t._id} className="border-b last:border-0">
                   <td className="p-3">{format(new Date(t.transactionDate), 'dd MMM yyyy')}</td>
                   <td className="p-3" title={t.notes ?? undefined}>
-                    {t.sourceLabel ?? t.source}
+                    {(() => {
+                      const [mainLine, ...breakdown] = (t.sourceLabel ?? t.source).split('\n')
+                      return (
+                        <>
+                          {mainLine}
+                          {breakdown.length > 0 && (
+                            <span className="text-muted-foreground block whitespace-pre-line text-[11px] leading-relaxed mt-0.5">
+                              {breakdown.join('\n')}
+                            </span>
+                          )}
+                        </>
+                      )
+                    })()}
                     {t.notes ? (
                       <span className="text-muted-foreground block truncate max-w-[200px]">{t.notes}</span>
                     ) : null}
@@ -309,5 +354,13 @@ export default function BankAccountHistoryPage() {
         </div>
       )}
     </div>
+  )
+}
+
+export default function BankAccountHistoryPage() {
+  return (
+    <Suspense fallback={null}>
+      <BankAccountHistoryPageContent />
+    </Suspense>
   )
 }

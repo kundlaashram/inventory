@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import BuyingEntry from '@/models/BuyingEntry'
 import Container from '@/models/Container'
 import Product from '@/models/Product'
 import ChinaPerson from '@/models/ChinaPerson'
 import ChinaPersonTransaction from '@/models/ChinaPersonTransaction'
 import mongoose from 'mongoose'
+import { indiaCtn, parseCbmBreakdown } from '@/lib/cbm-breakdown'
 import { format } from 'date-fns'
 
 export const dynamic = 'force-dynamic'
@@ -36,17 +38,20 @@ export async function GET(req: NextRequest) {
     await connectDB()
 
     const filter: Record<string, unknown> = { product: new mongoose.Types.ObjectId(productId) }
-    if (status) filter.currentStatus = status
+    // "outstanding" returns every unpaid + partially-paid entry (used by the Make Payment
+    // dropdown) with no pagination cap, so old dues are never hidden past the limit window.
+    const outstanding = status === 'outstanding'
+    if (outstanding) filter.currentStatus = { $in: ['unpaid', 'partiallypaid'] }
+    else if (status) filter.currentStatus = status
 
     const skip = (page - 1) * limit
+    const entriesQuery = BuyingEntry.find(filter)
+      .sort({ createdAt: -1 })
+      .populate('product', 'productName')
+      .populate('containerId', 'containerId containerName status')
+    if (!outstanding) entriesQuery.skip(skip).limit(limit)
     const [rawEntries, total] = await Promise.all([
-      BuyingEntry.find(filter)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean()
-        .populate('product', 'productName')
-        .populate('containerId', 'containerId containerName status'),
+      entriesQuery.lean(),
       BuyingEntry.countDocuments(filter),
     ])
 
@@ -88,7 +93,9 @@ export async function GET(req: NextRequest) {
       success: true,
       data: {
         entries,
-        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+        pagination: outstanding
+          ? { page: 1, limit: total, total, pages: 1 }
+          : { page, limit, total, pages: Math.ceil(total / limit) },
       },
     })
   } catch (error) {
@@ -127,6 +134,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     if (!entrySchema.product(body.product) || !entrySchema.totalCtn(body.totalCtn) || !entrySchema.qty(body.qty) || !entrySchema.rate(body.rate) || !entrySchema.cbm(body.cbm) || !entrySchema.weight(body.weight) || !entrySchema.entryDate(body.entryDate)) {
       return NextResponse.json(
@@ -178,6 +193,17 @@ export async function POST(req: NextRequest) {
 
     const initialAvailableCtn = Math.max(0, totalCtn - chinaWarehouseCtnRaw - inTransitCtnRaw)
 
+    const cbmBreakdown = parseCbmBreakdown(
+      body.cbmBreakdown,
+      indiaCtn(totalCtn, chinaWarehouseCtnRaw, inTransitCtnRaw)
+    )
+    if (typeof cbmBreakdown === 'string') {
+      return NextResponse.json(
+        { success: false, error: 'Validation failed', message: cbmBreakdown },
+        { status: 400 }
+      )
+    }
+
     const entry = await BuyingEntry.create({
       product: body.product,
       mark,
@@ -185,6 +211,7 @@ export async function POST(req: NextRequest) {
       qty: body.qty,
       rate: body.rate,
       cbm: body.cbm,
+      cbmBreakdown: cbmBreakdown ?? undefined,
       weight: body.weight,
       givenAmount: advanceAmt ?? 0,
       hasAdvancePayment: hasAdvance,

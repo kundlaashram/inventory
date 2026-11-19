@@ -1,14 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
-import SellBillItem from '@/models/SellBillItem'
-import SellBill from '@/models/SellBill'
-import Company from '@/models/Company'
-import Expense from '@/models/Expense'
-import PaymentReceipt from '@/models/PaymentReceipt'
-import { getReportDateRange, getPeriodFormat } from '@/lib/report-utils'
+import { reportModels } from '@/lib/year-reset/archive'
+import { getReportDateRange, resolveGranularity, buildTrendSeries } from '@/lib/report-utils'
 import mongoose from 'mongoose'
 import { grossProfitPct } from '@/lib/calculations'
+import { countedIn, loadRevenueExclusion } from '@/lib/revenue-exclusion'
 
 export const dynamic = 'force-dynamic'
 
@@ -51,6 +48,11 @@ const itemCostField = {
   },
 }
 
+// Second $addFields stage: compute adjustedProfit from pre-computed adjustedRevenue and itemCost
+const adjustedProfitStage = {
+  $addFields: { adjustedProfit: { $subtract: ['$adjustedRevenue', '$itemCost'] } },
+}
+
 // Reusable lookup + unwind for joining SellBillItem → SellBill
 const billLookupStages = [
   {
@@ -80,9 +82,17 @@ export async function GET(req: NextRequest) {
     const withExpenses = searchParams.get('withExpenses') === 'true'
 
     const { start, end } = getReportDateRange(period, startDate, endDate)
+    // The trend chart buckets one step finer than the selected period, so a month
+    // breaks into its days instead of collapsing into a single bar.
+    const granularity = resolveGranularity(searchParams.get('granularity'), period, start, end)
     await connectDB()
+    // No archive parameter means the live database, exactly as before.
+    const { SellBillItem, SellBill, Company, Expense, PaymentReceipt } = reportModels(searchParams.get('archive'))
+    // Companies flagged "Exclude from revenue": out of Revenue / Cost, profit still counts
+    const exclusion = await loadRevenueExclusion(Company, searchParams)
+    const excludedIds = exclusion.ids
 
-    const periodFormat = getPeriodFormat(period)
+    const DAY_BUCKET = '%Y-%m-%d'
     const dateMatch = { 'bill.billDate': { $gte: start, $lte: end } }
 
     const [
@@ -105,12 +115,14 @@ export async function GET(req: NextRequest) {
             ...adjustedRevenueField,
           },
         },
+        adjustedProfitStage,
         {
           $group: {
             _id: null,
-            revenue: { $sum: '$adjustedRevenue' },
-            cost: { $sum: '$itemCost' },
-            grossProfit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            grossProfit: { $sum: '$adjustedProfit' },
+            ctnSold: { $sum: '$ctnSold' },
           },
         },
       ]),
@@ -124,16 +136,17 @@ export async function GET(req: NextRequest) {
             ...itemCostField,
             ...adjustedRevenueField,
             period: {
-              $dateToString: { format: periodFormat, date: '$bill.billDate' },
+              $dateToString: { format: DAY_BUCKET, date: '$bill.billDate' },
             },
           },
         },
+        adjustedProfitStage,
         {
           $group: {
             _id: '$period',
-            revenue: { $sum: '$adjustedRevenue' },
-            cost: { $sum: '$itemCost' },
-            grossProfit: { $sum: '$totalProfit' },
+            revenue: { $sum: countedIn('$adjustedRevenue', excludedIds) },
+            cost: { $sum: countedIn('$itemCost', excludedIds) },
+            grossProfit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { _id: 1 } },
@@ -151,7 +164,7 @@ export async function GET(req: NextRequest) {
         {
           $group: {
             _id: {
-              $dateToString: { format: periodFormat, date: '$expenseDate' },
+              $dateToString: { format: DAY_BUCKET, date: '$expenseDate' },
             },
             total: { $sum: '$amount' },
           },
@@ -193,13 +206,14 @@ export async function GET(req: NextRequest) {
             },
           },
         },
+        adjustedProfitStage,
         {
           $group: {
             _id: { key: '$productKey', source: '$source' },
             productName: { $first: '$productName' },
             revenue: { $sum: '$adjustedRevenue' },
             cost: { $sum: '$itemCost' },
-            profit: { $sum: '$totalProfit' },
+            profit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { revenue: -1 } },
@@ -220,15 +234,32 @@ export async function GET(req: NextRequest) {
         { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
         {
           $addFields: {
+            ...itemCostField,
             ...adjustedRevenueField,
           },
         },
+        adjustedProfitStage,
         {
           $group: {
-            _id: '$bill.company',
-            companyName: { $first: '$companyDoc.companyName' },
+            // Normalize missing vs explicit-null so bills predating the
+            // bankAccount field don't split into a separate group (dup rows).
+            _id: {
+              company: { $ifNull: ['$bill.company', null] },
+              bankAccount: { $ifNull: ['$bill.bankAccount', null] },
+            },
+            companyName: {
+              $first: {
+                $cond: [
+                  '$bill.company',
+                  '$companyDoc.companyName',
+                  { $ifNull: ['$bill.companyName', '—'] },
+                ],
+              },
+            },
+            isCashbook: { $first: { $ifNull: ['$bill.isCashbook', false] } },
+            isBankSale: { $first: { $ifNull: ['$bill.isBankSale', false] } },
             revenue: { $sum: '$adjustedRevenue' },
-            profit: { $sum: '$totalProfit' },
+            profit: { $sum: '$adjustedProfit' },
           },
         },
         { $sort: { revenue: -1 } },
@@ -256,13 +287,18 @@ export async function GET(req: NextRequest) {
 
     void withExpenses // used in query param only; kept for future use
 
-    const summary = summaryResult[0] ?? { revenue: 0, cost: 0, grossProfit: 0 }
+    const summary = summaryResult[0] ?? { revenue: 0, cost: 0, grossProfit: 0, ctnSold: 0 }
     const totalExpenses = expensesSum[0]?.total ?? 0
     const revenue = summary.revenue ?? 0
     const cost = summary.cost ?? 0
     const grossProfit = summary.grossProfit ?? 0
+    const ctnSold = summary.ctnSold ?? 0
     const netProfit = grossProfit - totalExpenses
-    const marginPct = grossProfitPct(revenue, cost)
+    // With a company excluded, Revenue − Cost leaves out its profit, so use Gross Profit itself
+    const marginPct =
+      excludedIds.length > 0
+        ? revenue > 0 ? parseFloat(((grossProfit / revenue) * 100).toFixed(2)) : 0
+        : grossProfitPct(revenue, cost)
     const netMarginPct = revenue > 0 ? (netProfit / revenue) * 100 : 0
 
     const productBreakdown = (byProduct as {
@@ -296,26 +332,45 @@ export async function GET(req: NextRequest) {
       ])
     )
     const companyBreakdown = byCompany.map(
-      (r: { _id: mongoose.Types.ObjectId; companyName?: string; revenue: number; profit: number }) => {
-        const isCashbook = r._id == null
+      (r: { _id: { company: mongoose.Types.ObjectId; bankAccount: mongoose.Types.ObjectId }; companyName?: string; isCashbook?: boolean; isBankSale?: boolean; revenue: number; profit: number }) => {
+        const companyId = r._id?.company
+        const hasCompany = companyId != null
+        const isCashbook = !hasCompany && !!r.isCashbook
+        const isBankSale = !hasCompany && !!r.isBankSale
+        const displayName = isCashbook
+          ? '💵 Cashbook'
+          : isBankSale
+          ? (r.companyName ?? 'Bank Account')
+          : (r.companyName ?? '—')
         return {
-          companyId: r._id,
-          companyName: isCashbook ? '💵 Cashbook' : (r.companyName ?? '—'),
+          companyId,
+          isCashbook,
+          isBankSale,
+          companyName: displayName,
           revenue: r.revenue,
           profit: r.profit,
-          // Cashbook bills are paid at point of sale — no outstanding
-          outstanding: isCashbook
-            ? 0
-            : (billedMap[String(r._id)] ?? 0) -
-              (receivedMap[String(r._id)] ?? 0) +
-              (openingBalanceMap[String(r._id)] ?? 0),
+          outstanding: hasCompany
+            ? (billedMap[String(companyId)] ?? 0) -
+              (receivedMap[String(companyId)] ?? 0) +
+              (openingBalanceMap[String(companyId)] ?? 0)
+            : 0,
         }
       }
     )
 
-    const expenseByPeriodMap = Object.fromEntries(
-      (expensesByPeriod as { _id: string; total: number }[]).map((r) => [r._id, r.total])
-    )
+    const chart = buildTrendSeries({
+      start,
+      end,
+      granularity,
+      sales: new Map(
+        (chartResult as { _id: string; revenue: number; cost: number; grossProfit: number }[]).map(
+          (r) => [r._id, { revenue: r.revenue, cost: r.cost, grossProfit: r.grossProfit }]
+        )
+      ),
+      expenses: new Map(
+        (expensesByPeriod as { _id: string; total: number }[]).map((r) => [r._id, r.total])
+      ),
+    })
 
     return NextResponse.json({
       success: true,
@@ -328,19 +383,14 @@ export async function GET(req: NextRequest) {
           netProfit,
           marginPct,
           netMarginPct,
+          ctnSold,
         },
-        chart: chartResult.map(
-          (r: { _id: string; revenue: number; cost: number; grossProfit: number }) => ({
-            period: r._id,
-            revenue: r.revenue,
-            cost: r.cost,
-            grossProfit: r.grossProfit,
-            netProfit: r.grossProfit - (expenseByPeriodMap[r._id] ?? 0),
-          })
-        ),
+        chart,
+        granularity,
         byProduct: productBreakdown,
         byCompany: companyBreakdown,
         dateRange: { start, end },
+        revenueExclusion: { companies: exclusion.companies, included: exclusion.included },
       },
     })
   } catch (error) {

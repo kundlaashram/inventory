@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import Image from 'next/image'
@@ -19,14 +19,20 @@ import { toast } from 'sonner'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { AmountDisplay } from '@/components/ui/AmountDisplay'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { Pagination } from '@/components/ui/Pagination'
 import type { IndiaBuyingEntryRow } from '@/components/products/IndiaBuyingEntryTable'
 import { cn } from '@/lib/utils'
+import { useUrlParams, useSyncUrlParams, useListHref } from '@/hooks/useUrlFilters'
+
+const SELLING_HISTORY_PAGE_SIZE = 20
 
 interface SellingHistoryRow {
   _id: string
   sellBillId: string
   billNumber: number
   billDate: string
+  isCashbook?: boolean
+  isBankSale?: boolean
   companyId?: string
   companyName: string
   ctnSold: number
@@ -34,6 +40,7 @@ interface SellingHistoryRow {
   ratePerPcs: number
   totalAmount: number
   totalProfit: number
+  marginPercent: number
   fifoNote?: string
 }
 
@@ -42,18 +49,22 @@ interface IndiaProductDetail {
   productName: string
   productDescription?: string
   productImage?: string
+  ctnWeightKg?: number | null
+  ctnCbm?: number | null
   buyingEntriesCount: number
   totalCtn: number
   availableCtn: number
+  availablePcs: number
   totalSoldCtn: number
   totalInvested: number
   totalProfit: number
   sellingHistory: SellingHistoryRow[]
 }
 
-export default function IndiaProductDetailPage() {
+function IndiaProductDetailPageContent() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/products')
   const id = params?.id as string
   const [product, setProduct] = useState<IndiaProductDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -61,6 +72,9 @@ export default function IndiaProductDetailPage() {
   const [entrySheetOpen, setEntrySheetOpen] = useState(false)
   const [paymentDialogOpen, setPaymentDialogOpen] = useState(false)
   const [editingEntry, setEditingEntry] = useState<IndiaBuyingEntryRow | null>(null)
+  const url = useUrlParams()
+  const [sellingPage, setSellingPage] = useState(() => url.int('sellingPage', 1))
+  useSyncUrlParams({ sellingPage: sellingPage > 1 ? sellingPage : undefined })
 
   const fetchProduct = useCallback(async () => {
     if (!id) return
@@ -95,7 +109,7 @@ export default function IndiaProductDetailPage() {
       return
     }
     toast.success('Product deleted')
-    router.push('/products')
+    router.push(listHref)
   }
 
   function openAddEntry() {
@@ -116,13 +130,21 @@ export default function IndiaProductDetailPage() {
     )
   }
 
+  const sellingHistory = product.sellingHistory ?? []
+  const sellingTotalPages = Math.max(1, Math.ceil(sellingHistory.length / SELLING_HISTORY_PAGE_SIZE))
+  const currentSellingPage = Math.min(sellingPage, sellingTotalPages)
+  const pagedSellingHistory = sellingHistory.slice(
+    (currentSellingPage - 1) * SELLING_HISTORY_PAGE_SIZE,
+    currentSellingPage * SELLING_HISTORY_PAGE_SIZE
+  )
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={product.productName}
         description={product.productDescription ?? undefined}
         breadcrumb={
-          <Link href="/products" className="text-muted-foreground hover:text-foreground">
+          <Link href={listHref} className="text-muted-foreground hover:text-foreground">
             Products
           </Link>
         }
@@ -160,7 +182,7 @@ export default function IndiaProductDetailPage() {
             </div>
           )}
         </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
           <Card>
             <CardContent className="pt-4">
               <p className="text-sm text-muted-foreground">Total CTN Bought</p>
@@ -171,6 +193,12 @@ export default function IndiaProductDetailPage() {
             <CardContent className="pt-4">
               <p className="text-sm text-muted-foreground">Available CTN</p>
               <p className="text-2xl font-semibold">{product.availableCtn}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="pt-4">
+              <p className="text-sm text-muted-foreground">Available Pcs</p>
+              <p className="text-2xl font-semibold">{product.availablePcs}</p>
             </CardContent>
           </Card>
           <Card>
@@ -213,9 +241,10 @@ export default function IndiaProductDetailPage() {
           />
         </TabsContent>
         <TabsContent value="selling" className="mt-4">
-          {!product.sellingHistory?.length ? (
+          {!sellingHistory.length ? (
             <div className="rounded-md border py-12 text-center text-muted-foreground">No sales yet for this product.</div>
           ) : (
+            <div className="space-y-4">
             <div className="rounded-md border overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -228,10 +257,11 @@ export default function IndiaProductDetailPage() {
                     <th className="text-right p-3 font-medium">Rate per PCS (₹)</th>
                     <th className="text-right p-3 font-medium">Total Amount (₹)</th>
                     <th className="text-right p-3 font-medium">Profit (₹)</th>
+                    <th className="text-right p-3 font-medium">Margin %</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {product.sellingHistory.map((row) => (
+                  {pagedSellingHistory.map((row) => (
                     <tr key={row._id} className="border-b last:border-0">
                       <td className="p-3">
                         <Link href={`/sale-bills/${row.sellBillId}`} className="text-primary hover:underline font-medium">
@@ -240,7 +270,16 @@ export default function IndiaProductDetailPage() {
                       </td>
                       <td className="p-3">{format(new Date(row.billDate), 'dd MMM yyyy')}</td>
                       <td className="p-3">
-                        {row.companyId ? (
+                        {row.isCashbook ? (
+                          <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400 text-xs font-semibold">
+                            💵 CASHBOOK
+                          </span>
+                        ) : row.isBankSale ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            {row.companyName}
+                            <span className="text-blue-700 dark:text-blue-400 text-[10px] font-semibold tracking-wide">🏦 BANK</span>
+                          </span>
+                        ) : row.companyId ? (
                           <Link href={`/companies/${row.companyId}`} className="text-primary hover:underline">
                             {row.companyName}
                           </Link>
@@ -261,10 +300,30 @@ export default function IndiaProductDetailPage() {
                           <AmountDisplay amount={row.totalProfit} showSign />
                         </span>
                       </td>
+                      <td
+                        className={cn(
+                          'p-3 text-right tabular-nums',
+                          row.marginPercent > 20
+                            ? 'text-green-600'
+                            : row.marginPercent >= 10
+                            ? 'text-amber-500'
+                            : 'text-red-600'
+                        )}
+                      >
+                        {(row.marginPercent ?? 0).toFixed(1)}%
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+            <Pagination
+              page={currentSellingPage}
+              totalPages={sellingTotalPages}
+              total={sellingHistory.length}
+              pageSize={SELLING_HISTORY_PAGE_SIZE}
+              onPageChange={setSellingPage}
+            />
             </div>
           )}
         </TabsContent>
@@ -311,10 +370,20 @@ export default function IndiaProductDetailPage() {
           productName: product.productName,
           productDescription: product.productDescription ?? '',
           productImage: product.productImage ?? '',
+          ctnWeightKg: product.ctnWeightKg,
+          ctnCbm: product.ctnCbm,
         }}
         title="Edit India Product"
         submitLabel="Update"
       />
     </div>
+  )
+}
+
+export default function IndiaProductDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <IndiaProductDetailPageContent />
+    </Suspense>
   )
 }

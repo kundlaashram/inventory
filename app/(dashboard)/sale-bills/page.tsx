@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { FileText, Plus, Pencil, Trash2, Download } from 'lucide-react'
+import { FileText, Plus, Pencil, Trash2, Download, Sparkles } from 'lucide-react'
 import { format } from 'date-fns'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/button'
@@ -19,6 +19,7 @@ import { TableSkeleton } from '@/components/ui/TableSkeleton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { Pagination } from '@/components/ui/Pagination'
 import { generateBillFileName } from '@/lib/utils'
+import { useUrlParams, useSyncUrlParams, dateRangeParams } from '@/hooks/useUrlFilters'
 
 interface BillRow {
   _id: string
@@ -26,6 +27,7 @@ interface BillRow {
   billDate: string
   company: string
   isCashbook?: boolean
+  isBankSale?: boolean
   companyName: string
   totalAmount: number
   grandTotal?: number
@@ -37,11 +39,12 @@ interface BillRow {
   contact2Mobile?: string
 }
 
-export default function SellBillsPage() {
+function SellBillsPageContent() {
   const router = useRouter()
-  const [search, setSearch] = useState('')
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [search, setSearch] = useState(() => url.str('search'))
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
+  const [page, setPage] = useState(() => url.int('page', 1))
   const [loading, setLoading] = useState(true)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [data, setData] = useState<{
@@ -69,6 +72,12 @@ export default function SellBillsPage() {
   useEffect(() => {
     fetchBills()
   }, [fetchBills])
+
+  useSyncUrlParams({
+    search: debouncedSearch.trim(),
+    ...dateRangeParams(dateRange),
+    page: page > 1 ? page : undefined,
+  })
 
   async function handleDelete(billId: string) {
     const result = await apiDelete(`/api/sell-bills/${billId}`)
@@ -114,12 +123,20 @@ export default function SellBillsPage() {
         title="Sale Bills"
         description="Create and manage sale bills."
         action={
-          <Button asChild>
-            <Link href="/sale-bills/new">
-              <Plus className="mr-2 h-4 w-4" />
-              Add New Bill
-            </Link>
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" asChild>
+              <Link href="/sale-bills/quick">
+                <Sparkles className="mr-2 h-4 w-4" />
+                Quick Bill from Message
+              </Link>
+            </Button>
+            <Button asChild>
+              <Link href="/sale-bills/new">
+                <Plus className="mr-2 h-4 w-4" />
+                Add New Bill
+              </Link>
+            </Button>
+          </div>
         }
       />
 
@@ -180,8 +197,13 @@ export default function SellBillsPage() {
                     <td className="p-4 whitespace-nowrap">{new Date(b.billDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}</td>
                     <td className="p-4">
                       {b.isCashbook ? (
-                        <span className="flex items-center gap-1 text-green-700 dark:text-green-400 font-medium">
-                          💵 Cashbook
+                        <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400 text-xs font-semibold">
+                          💵 CASHBOOK
+                        </span>
+                      ) : b.isBankSale ? (
+                        <span className="inline-flex items-center gap-1.5 font-medium">
+                          {b.companyName}
+                          <span className="text-blue-700 dark:text-blue-400 text-[10px] font-semibold tracking-wide">🏦 BANK</span>
                         </span>
                       ) : (
                         <div className="flex flex-col">
@@ -262,5 +284,13 @@ export default function SellBillsPage() {
         />
       )}
     </div>
+  )
+}
+
+export default function SellBillsPage() {
+  return (
+    <Suspense fallback={<TableSkeleton rows={10} columns={6} />}>
+      <SellBillsPageContent />
+    </Suspense>
   )
 }

@@ -108,16 +108,16 @@ export function MakeIndiaPaymentDialog({
   useEffect(() => {
     if (open && productId) {
       apiGet<{ entries: { _id: string; entryDate: string; totalCtn: number; remainingAmount: number }[] }>(
-        `/api/india-buying-entries?productId=${productId}&limit=100`
+        `/api/india-buying-entries?productId=${productId}&status=outstanding`
       ).then((r) => {
-        if (r.success) setEntries(r.data.entries ?? [])
+        if (r.success) setEntries((r.data.entries ?? []).filter((e) => (e.remainingAmount ?? 0) > 0))
         else setEntries([])
       })
       apiGet<{ accounts: { _id: string; accountName: string; currentBalance: number }[] }>('/api/banks').then((r) => {
         if (r.success) setAccounts(r.data.accounts ?? [])
         else setAccounts([])
       })
-      apiGet<{ companies: { _id: string; companyName: string; outstandingBalance: number }[] }>('/api/companies?limit=500').then((r) => {
+      apiGet<{ companies: { _id: string; companyName: string; outstandingBalance: number }[] }>('/api/companies?basic=true').then((r) => {
         if (r.success) setCompanies(r.data.companies ?? [])
         else setCompanies([])
       })

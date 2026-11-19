@@ -14,6 +14,7 @@ import { OutstandingTemplate, type OutstandingTemplateProps } from '@/components
 import { generateOutstandingFileName } from '@/lib/utils'
 
 export const dynamic = 'force-dynamic'
+export const maxDuration = 60
 
 export async function GET(
   req: NextRequest,
@@ -23,11 +24,7 @@ export async function GET(
     const user = await getUserFromRequest(req)
     if (!user) {
       return NextResponse.json(
-        {
-          success: false,
-          error: 'Unauthorized',
-          message: 'Invalid or expired token',
-        },
+        { success: false, error: 'Unauthorized', message: 'Invalid or expired token' },
         { status: 401 }
       )
     }
@@ -35,11 +32,7 @@ export async function GET(
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
-        {
-          success: false,
-          error: 'Validation failed',
-          message: 'Invalid company id',
-        },
+        { success: false, error: 'Validation failed', message: 'Invalid company id' },
         { status: 400 }
       )
     }
@@ -62,7 +55,6 @@ export async function GET(
 
     const companyId = new mongoose.Types.ObjectId(id)
 
-    // Build full statement: bills (debit) + payments (credit), with running balance.
     const [bills, payments] = await Promise.all([
       SellBill.find({ company: companyId })
         .sort({ billDate: 1, createdAt: 1 })
@@ -93,24 +85,33 @@ export async function GET(
             pcsSold: item.pcsSold ?? 0,
             ratePerPcs: item.ratePerPcs ?? 0,
           }))
+        // A bill discounted below zero owes money back to the buyer, so it belongs
+        // in the credit column — same treatment as a payment made out to them.
+        const billAmount: number = bAny.grandTotal ?? b.totalAmount
         return {
           date: b.billDate,
           createdAt: b.createdAt,
           description: `INV-${b.billNumber}${
-            (b as { notes?: string }).notes
-              ? ` — ${(b as { notes?: string }).notes}`
-              : ''
+            (b as { notes?: string }).notes ? ` — ${(b as { notes?: string }).notes}` : ''
           }`,
-          debit: bAny.grandTotal ?? b.totalAmount,
-          credit: null as number | null,
+          debit: billAmount < 0 ? null : billAmount,
+          credit: billAmount < 0 ? Math.abs(billAmount) : null,
           items,
+          subtotal: b.totalAmount,
+          extraCharges: (bAny.extraCharges as number | undefined) ?? 0,
+          extraChargesNote: (bAny.extraChargesNote as string | undefined) ?? '',
+          discount: (bAny.discount as number | undefined) ?? 0,
+          discountNote: (bAny.discountNote as string | undefined) ?? '',
         }
       }),
       ...payments.map((p) => {
         const pAny = p as { paymentDate?: Date; date?: Date; companyNote?: string; remark?: string; paymentMode?: string }
         const isSetOff = pAny.paymentMode === 'set_off'
+        const isPaymentOut = p.amount < 0
         let description: string
-        if (isSetOff) {
+        if (isPaymentOut) {
+          description = `Payment made to company${pAny.companyNote ? ` — ${pAny.companyNote}` : ''}`
+        } else if (isSetOff) {
           const cleanRemark = pAny.remark
             ? pAny.remark
                 .replace(/^Payment for India Product:\s*/i, '')
@@ -124,18 +125,22 @@ export async function GET(
         }
         return {
           items: [] as { productName: string; ctnSold: number; pcsSold: number; ratePerPcs: number }[],
+          subtotal: null as number | null,
+          extraCharges: 0,
+          extraChargesNote: '',
+          discount: 0,
+          discountNote: '',
           date: (pAny.paymentDate || pAny.date || new Date()) as Date,
           createdAt: p.createdAt,
           description,
-          debit: null as number | null,
-          credit: p.amount,
+          debit: isPaymentOut ? Math.abs(p.amount) : null,
+          credit: isPaymentOut ? null : p.amount,
         }
       }),
     ].sort((a, b) => {
       const aDate = a.date instanceof Date ? a.date.getTime() : new Date(a.date as string).getTime()
       const bDate = b.date instanceof Date ? b.date.getTime() : new Date(b.date as string).getTime()
       if (aDate !== bDate) return aDate - bDate
-      
       const ad = a.createdAt instanceof Date ? a.createdAt.getTime() : new Date(a.createdAt).getTime()
       const bd = b.createdAt instanceof Date ? b.createdAt.getTime() : new Date(b.createdAt).getTime()
       return ad - bd
@@ -147,12 +152,7 @@ export async function GET(
     const computedTransactions = allTx.map((tx, index) => {
       if (tx.debit) balance += tx.debit
       if (tx.credit) balance -= tx.credit
-      
-      // If balance hits zero (safely comparing floating point), we keep track of this index.
-      if (Math.abs(balance) < 0.001) {
-        lastZeroBalanceIndex = index
-      }
-
+      if (Math.abs(balance) < 0.001) lastZeroBalanceIndex = index
       return {
         date: tx.date,
         description: tx.description,
@@ -160,14 +160,21 @@ export async function GET(
         credit: tx.credit,
         balance,
         items: tx.items,
+        subtotal: tx.subtotal,
+        extraCharges: tx.extraCharges,
+        extraChargesNote: tx.extraChargesNote,
+        discount: tx.discount,
+        discountNote: tx.discountNote,
       }
     })
+
+    const fullReport = req.nextUrl.searchParams.get('full') === 'true'
 
     let transactions = computedTransactions
     let modifiedOpeningBalance = company.openingBalance || 0
     let modifiedOpeningBalanceNotes = company.openingBalanceNotes
 
-    if (lastZeroBalanceIndex !== -1) {
+    if (!fullReport && lastZeroBalanceIndex !== -1) {
       transactions = computedTransactions.slice(lastZeroBalanceIndex + 1)
       modifiedOpeningBalance = 0
       modifiedOpeningBalanceNotes = 'Balance Brought Forward (Cleared)'
@@ -194,7 +201,6 @@ export async function GET(
     })
 
     const pdfBuffer = await renderToBuffer(doc as any)
-
     const filename = generateOutstandingFileName(company.companyName)
 
     return new NextResponse(pdfBuffer as any, {
@@ -215,4 +221,3 @@ export async function GET(
     )
   }
 }
-

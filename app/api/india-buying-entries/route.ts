@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import IndiaBuyingEntry from '@/models/IndiaBuyingEntry'
 import IndiaProduct from '@/models/IndiaProduct'
 import BankAccount from '@/models/BankAccount'
 import BankTransaction from '@/models/BankTransaction'
+import { recalculateBankAccountLedger } from '@/lib/bank-ledger'
 import mongoose from 'mongoose'
 import { format } from 'date-fns'
 import { recalcIndiaBuyingEntryGivenAndStatus } from '@/lib/india-buying-entry-payments'
@@ -36,11 +38,17 @@ export async function GET(req: NextRequest) {
     await connectDB()
 
     const filter: Record<string, unknown> = { product: new mongoose.Types.ObjectId(productId) }
-    if (status) filter.currentStatus = status
+    // "outstanding" returns every unpaid + partially-paid entry (used by the Make Payment
+    // dropdown) with no pagination cap, so old dues are never hidden past the limit window.
+    const outstanding = status === 'outstanding'
+    if (outstanding) filter.currentStatus = { $in: ['unpaid', 'partiallypaid'] }
+    else if (status) filter.currentStatus = status
 
     const skip = (page - 1) * limit
+    const query = IndiaBuyingEntry.find(filter).sort({ createdAt: -1 })
+    if (!outstanding) query.skip(skip).limit(limit)
     const [entries, total] = await Promise.all([
-      IndiaBuyingEntry.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean().populate('product', 'productName'),
+      query.lean().populate('product', 'productName'),
       IndiaBuyingEntry.countDocuments(filter),
     ])
 
@@ -48,7 +56,9 @@ export async function GET(req: NextRequest) {
       success: true,
       data: {
         entries,
-        pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+        pagination: outstanding
+          ? { page: 1, limit: total, total, pages: 1 }
+          : { page, limit, total, pages: Math.ceil(total / limit) },
       },
     })
   } catch (error) {
@@ -81,6 +91,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     if (
       !entrySchema.product(body.product) ||
@@ -165,18 +183,13 @@ export async function POST(req: NextRequest) {
           referenceType: 'india_buying_advance',
         })
       } else {
-        const lastTx = await BankTransaction.findOne({ bankAccount: advanceBankId })
-          .sort({ transactionDate: -1, createdAt: -1 })
-          .select('balanceAfter')
-          .lean()
-        const lastBalance = lastTx?.balanceAfter ?? 0
-        const newBalance = lastBalance - advanceAmt
-
+        // balanceAfter is a placeholder — recalculateBankAccountLedger (true
+        // createdAt order) fixes it below.
         await BankTransaction.create({
           bankAccount: advanceBankId,
           type: 'debit',
           amount: advanceAmt,
-          balanceAfter: newBalance,
+          balanceAfter: 0,
           source: 'india_buying_advance',
           sourceRef: entry._id,
           sourceLabel,
@@ -184,7 +197,7 @@ export async function POST(req: NextRequest) {
           notes: entry.advanceNote,
           createdBy,
         })
-        await BankAccount.findByIdAndUpdate(advanceBankId, { currentBalance: newBalance })
+        await recalculateBankAccountLedger(advanceBankId, { updatedBy: createdBy })
       }
     }
 

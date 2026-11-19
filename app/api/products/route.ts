@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import Product from '@/models/Product'
 import BuyingEntry from '@/models/BuyingEntry'
+import { parseMeasure } from '@/lib/utils'
 
 export const dynamic = 'force-dynamic'
 
@@ -17,7 +19,7 @@ export async function GET(req: NextRequest) {
     }
     const { searchParams } = new URL(req.url)
     const page = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10))
-    const limit = Math.min(100, Math.max(1, parseInt(searchParams.get('limit') ?? '100', 10)))
+    const limit = Math.min(200, Math.max(1, parseInt(searchParams.get('limit') ?? '200', 10)))
     const search = searchParams.get('search')?.trim() ?? ''
     type ChinaFilter =
       | 'all'
@@ -40,6 +42,8 @@ export async function GET(req: NextRequest) {
     const chinaFilter: ChinaFilter = allowedFilters.includes(rawFilter as ChinaFilter)
       ? (rawFilter as ChinaFilter)
       : 'all'
+    const rawMinAvailableCtn = parseInt(searchParams.get('minAvailableCtn') ?? '', 10)
+    const minAvailableCtn = Number.isFinite(rawMinAvailableCtn) && rawMinAvailableCtn > 0 ? rawMinAvailableCtn : null
 
     await connectDB()
 
@@ -92,6 +96,20 @@ export async function GET(req: NextRequest) {
           totalCbm: { $sum: { $ifNull: ['$totalCbm', 0] } },
           totalWeight: { $sum: { $ifNull: ['$totalWeight', 0] } },
           remainingAmount: { $sum: { $ifNull: ['$remainingAmount', 0] } },
+          lockedAmountRMB: {
+            $sum: {
+              $cond: [
+                '$isLocked',
+                { $multiply: [{ $ifNull: ['$rate', 0] }, { $ifNull: ['$qty', 0] }, { $ifNull: ['$lockedCtn', 0] }] },
+                0,
+              ],
+            },
+          },
+          lockedAmountINR: {
+            $sum: {
+              $cond: ['$isLocked', { $ifNull: ['$lockedAmount', 0] }, 0],
+            },
+          },
           count: { $sum: 1 },
         },
       },
@@ -103,6 +121,39 @@ export async function GET(req: NextRequest) {
           _id: '$product',
           availablePcs: {
             $sum: { $round: [{ $multiply: ['$availableCtn', '$qty'] }, 0] },
+          },
+          stockValueINR: {
+            $sum: {
+              $multiply: [
+                { $round: [{ $multiply: ['$availableCtn', '$qty'] }, 0] },
+                { $ifNull: ['$finalCost', 0] },
+              ],
+            },
+          },
+          // Weighted avg final cost/pcs across available entries: only entries
+          // that actually carry a finalCost, so uncosted ones don't drag it down
+          costedPcs: {
+            $sum: {
+              $cond: [
+                { $gt: [{ $ifNull: ['$finalCost', 0] }, 0] },
+                { $round: [{ $multiply: ['$availableCtn', '$qty'] }, 0] },
+                0,
+              ],
+            },
+          },
+          costedValue: {
+            $sum: {
+              $cond: [
+                { $gt: [{ $ifNull: ['$finalCost', 0] }, 0] },
+                {
+                  $multiply: [
+                    { $round: [{ $multiply: ['$availableCtn', '$qty'] }, 0] },
+                    { $ifNull: ['$finalCost', 0] },
+                  ],
+                },
+                0,
+              ],
+            },
           },
         },
       },
@@ -136,6 +187,14 @@ export async function GET(req: NextRequest) {
     const statsByProduct = Object.fromEntries(entryStats.map((e) => [String(e._id), e]))
     const statusByProduct = Object.fromEntries(statusStats.map((e) => [String(e._id), e]))
     const availablePcsByProduct = Object.fromEntries(availablePcsStats.map((e) => [String(e._id), e.availablePcs as number]))
+    const stockValueByProduct = Object.fromEntries(availablePcsStats.map((e) => [String(e._id), e.stockValueINR as number]))
+    const avgCostByProduct = Object.fromEntries(
+      availablePcsStats.map((e) => {
+        const pcs = (e.costedPcs as number) ?? 0
+        const value = (e.costedValue as number) ?? 0
+        return [String(e._id), pcs > 0 ? value / pcs : 0]
+      })
+    )
 
     const enrichedProducts = products.map((p) => {
       const stats = statsByProduct[String(p._id)] ?? {
@@ -165,6 +224,8 @@ export async function GET(req: NextRequest) {
       const totalCbm = stats.totalCbm ?? 0
       const totalWeight = stats.totalWeight ?? 0
       const remainingAmount = stats.remainingAmount ?? 0
+      const lockedAmountRMB = stats.lockedAmountRMB ?? 0
+      const lockedAmountINR = stats.lockedAmountINR ?? 0
       const buyingEntries = stats.count ?? 0
 
       const chinaWarehouseReceived: 'yes' | 'no' =
@@ -191,11 +252,15 @@ export async function GET(req: NextRequest) {
         inTransitCtn,
         availableCtn,
         availablePcs: availablePcsByProduct[String(p._id)] ?? 0,
+        stockValueINR: Number((stockValueByProduct[String(p._id)] ?? 0).toFixed(2)),
+        avgFinalCostPerPcs: Number((avgCostByProduct[String(p._id)] ?? 0).toFixed(2)),
         soldCtn,
         chinaFactoryCtn,
         totalCbm,
         totalWeight,
         remainingAmount,
+        lockedAmountRMB,
+        lockedAmountINR,
         hasUnpaidEntries,
         chinaWarehouseReceived,
         hasWhReceived,
@@ -218,6 +283,7 @@ export async function GET(req: NextRequest) {
 
     // Apply active filter server-side
     const filteredProducts = enrichedProducts.filter((p) => {
+      if (minAvailableCtn !== null && p.availableCtn < minAvailableCtn) return false
       switch (chinaFilter) {
         case 'chinaFactory':
           return p.hasNotReceived
@@ -243,14 +309,17 @@ export async function GET(req: NextRequest) {
     const paginatedProducts = filteredProducts.slice(start, start + limit)
 
     // Totals across all filtered products (not just current page)
-    const { totalCbm: sumCbm, totalWeight: sumWeight, remainingAmount: sumRemaining } = filteredProducts.reduce(
+    const { totalCbm: sumCbm, totalWeight: sumWeight, remainingAmount: sumRemaining, lockedAmountRMB: sumLockedRMB, lockedAmountINR: sumLockedINR, stockValueINR: sumStockValueINR } = filteredProducts.reduce(
       (acc, p) => {
         acc.totalCbm += p.totalCbm ?? 0
         acc.totalWeight += p.totalWeight ?? 0
         acc.remainingAmount += p.remainingAmount ?? 0
+        acc.lockedAmountRMB += p.lockedAmountRMB ?? 0
+        acc.lockedAmountINR += p.lockedAmountINR ?? 0
+        acc.stockValueINR += p.stockValueINR ?? 0
         return acc
       },
-      { totalCbm: 0, totalWeight: 0, remainingAmount: 0 }
+      { totalCbm: 0, totalWeight: 0, remainingAmount: 0, lockedAmountRMB: 0, lockedAmountINR: 0, stockValueINR: 0 }
     )
 
     return NextResponse.json({
@@ -262,6 +331,9 @@ export async function GET(req: NextRequest) {
           cbm: sumCbm,
           weight: sumWeight,
           remainingToPay: sumRemaining,
+          lockedAmountRMB: sumLockedRMB,
+          lockedAmountINR: sumLockedINR,
+          stockValueINR: sumStockValueINR,
         },
         pagination: { page, limit, total: totalFiltered, pages: totalPages },
       },
@@ -294,6 +366,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     if (!createSchema.productName(body.productName)) {
       return NextResponse.json(
@@ -309,6 +389,8 @@ export async function POST(req: NextRequest) {
       productName: body.productName.trim(),
       productDescription: body.productDescription?.trim() || undefined,
       productImage: body.productImage || undefined,
+      ctnWeightKg: parseMeasure(body.ctnWeightKg),
+      ctnCbm: parseMeasure(body.ctnCbm),
       createdBy,
       updatedBy: createdBy,
     })

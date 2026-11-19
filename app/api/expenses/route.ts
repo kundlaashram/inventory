@@ -1,25 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, resolveCreatedBy } from '@/lib/auth'
 import { connectDB } from '@/lib/mongodb'
+import { ensureNotViewer } from '@/lib/permissions'
 import BankAccount from '@/models/BankAccount'
 import BankTransaction from '@/models/BankTransaction'
 import Expense from '@/models/Expense'
 import { createCashTransaction } from '@/lib/cash-transaction-helper'
+import { recalculateBankAccountLedger } from '@/lib/bank-ledger'
 import mongoose from 'mongoose'
 
 export const dynamic = 'force-dynamic'
-
-async function recomputeBankAccountBalance(bankAccountId: mongoose.Types.ObjectId): Promise<void> {
-  const txs = await BankTransaction.find({ bankAccount: bankAccountId })
-    .sort({ transactionDate: 1, createdAt: 1 })
-    .lean()
-  let balance = 0
-  for (const tx of txs) {
-    balance += tx.type === 'credit' ? tx.amount : -tx.amount
-    await BankTransaction.updateOne({ _id: tx._id }, { $set: { balanceAfter: balance } })
-  }
-  await BankAccount.findByIdAndUpdate(bankAccountId, { currentBalance: balance })
-}
 
 export async function GET(req: NextRequest) {
   try {
@@ -36,6 +26,7 @@ export async function GET(req: NextRequest) {
     const startDate = searchParams.get('startDate')?.trim()
     const endDate = searchParams.get('endDate')?.trim()
     const paidFrom = searchParams.get('paidFrom')?.trim()
+    const search = searchParams.get('search')?.trim()
 
     await connectDB()
 
@@ -50,6 +41,10 @@ export async function GET(req: NextRequest) {
       filter.paidFrom = new mongoose.Types.ObjectId(paidFrom)
       baseFilter.paidFrom = filter.paidFrom
     }
+    if (search) {
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+      filter.$or = [{ title: regex }, { remark: regex }]
+    }
 
     const skip = (page - 1) * limit
     const now = new Date()
@@ -60,7 +55,15 @@ export async function GET(req: NextRequest) {
     const yearStart = new Date(now.getFullYear(), 0, 1)
     const yearEnd = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999)
 
-    const [list, total, todayAgg, monthAgg, yearAgg] = await Promise.all([
+    const dateRangeAggPromise =
+      startDate || endDate
+        ? Expense.aggregate([
+            { $match: filter },
+            { $group: { _id: null, total: { $sum: '$amount' } } },
+          ]).then((r) => r[0]?.total ?? 0)
+        : Promise.resolve(null)
+
+    const [list, total, todayAgg, monthAgg, yearAgg, dateRangeAgg] = await Promise.all([
       Expense.find(filter)
         .sort({ expenseDate: -1, createdAt: -1 })
         .skip(skip)
@@ -80,6 +83,7 @@ export async function GET(req: NextRequest) {
         { $match: { ...baseFilter, expenseDate: { $gte: yearStart, $lte: yearEnd } } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]).then((r) => r[0]?.total ?? 0),
+      dateRangeAggPromise,
     ])
 
     const expenses = list.map((e) => ({
@@ -97,7 +101,7 @@ export async function GET(req: NextRequest) {
       data: {
         expenses,
         pagination: { page, limit, total, pages: Math.ceil(total / limit) },
-        summary: { today: todayAgg, thisMonth: monthAgg, thisYear: yearAgg },
+        summary: { today: todayAgg, thisMonth: monthAgg, thisYear: yearAgg, dateRange: dateRangeAgg },
       },
     })
   } catch (error) {
@@ -122,6 +126,14 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const body = await req.json()
     const title = body.title != null ? String(body.title).trim() : ''
     const amount = Number(body.amount)
@@ -192,17 +204,15 @@ export async function POST(req: NextRequest) {
         referenceType: 'Expense',
       })
     } else {
-      const lastTx = await BankTransaction.findOne({ bankAccount: paidFromOid })
-        .sort({ transactionDate: -1, createdAt: -1 })
-        .select('balanceAfter')
-        .lean()
-      const lastBalance = lastTx?.balanceAfter ?? 0
-      const newBalance = lastBalance - amount
+      // balanceAfter is a placeholder — recalculateBankAccountLedger (true
+      // createdAt order) fixes it below. Looking up "the last transaction by
+      // transactionDate" breaks the moment any transaction on this account is
+      // backdated or edited.
       await BankTransaction.create({
         bankAccount: paidFromOid,
         type: 'debit',
         amount,
-        balanceAfter: newBalance,
+        balanceAfter: 0,
         source: 'expense',
         sourceRef: expense._id,
         sourceLabel: `Expense: ${title}`,
@@ -210,7 +220,7 @@ export async function POST(req: NextRequest) {
         notes: remark,
         createdBy,
       })
-      await BankAccount.findByIdAndUpdate(paidFromOid, { currentBalance: newBalance })
+      await recalculateBankAccountLedger(paidFromOid, { updatedBy: createdBy })
     }
 
     return NextResponse.json({

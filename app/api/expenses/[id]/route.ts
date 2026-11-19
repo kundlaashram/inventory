@@ -5,21 +5,11 @@ import BankAccount from '@/models/BankAccount'
 import BankTransaction from '@/models/BankTransaction'
 import Expense from '@/models/Expense'
 import { createCashTransaction } from '@/lib/cash-transaction-helper'
+import { recalculateBankAccountLedger } from '@/lib/bank-ledger'
 import mongoose from 'mongoose'
+import { ensureCanDelete, ensureNotViewer } from '@/lib/permissions'
 
 export const dynamic = 'force-dynamic'
-
-async function recomputeBankAccountBalance(bankAccountId: mongoose.Types.ObjectId): Promise<void> {
-  const txs = await BankTransaction.find({ bankAccount: bankAccountId })
-    .sort({ transactionDate: 1, createdAt: 1 })
-    .lean()
-  let balance = 0
-  for (const tx of txs) {
-    balance += tx.type === 'credit' ? tx.amount : -tx.amount
-    await BankTransaction.updateOne({ _id: tx._id }, { $set: { balanceAfter: balance } })
-  }
-  await BankAccount.findByIdAndUpdate(bankAccountId, { currentBalance: balance })
-}
 
 export async function GET(
   req: NextRequest,
@@ -82,6 +72,14 @@ export async function PUT(
         { status: 401 }
       )
     }
+    const perm = ensureNotViewer(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -165,7 +163,7 @@ export async function PUT(
         createdBy: updatedBy,
         sortOrder: 1,
       })
-      await recomputeBankAccountBalance(originalTx.bankAccount as mongoose.Types.ObjectId)
+      await recalculateBankAccountLedger(originalTx.bankAccount as mongoose.Types.ObjectId)
     }
 
     const account = await BankAccount.findById(paidFromId).lean()
@@ -215,7 +213,7 @@ export async function PUT(
         notes: remark,
         createdBy: updatedBy,
       })
-      await recomputeBankAccountBalance(paidFromOid)
+      await recalculateBankAccountLedger(paidFromOid)
     }
 
     return NextResponse.json({ success: true, data: { _id: expense._id } })
@@ -244,6 +242,14 @@ export async function DELETE(
         { status: 401 }
       )
     }
+    const perm = ensureCanDelete(user)
+    if (!perm.ok) {
+      return NextResponse.json(
+        { success: false, error: 'Forbidden', message: perm.message },
+        { status: 403 }
+      )
+    }
+
     const { id } = await params
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return NextResponse.json(
@@ -293,7 +299,7 @@ export async function DELETE(
           createdBy: tx.createdBy,
           sortOrder: 1,
         })
-        await recomputeBankAccountBalance(tx.bankAccount as mongoose.Types.ObjectId)
+        await recalculateBankAccountLedger(tx.bankAccount as mongoose.Types.ObjectId)
       }
     }
     await Expense.findByIdAndDelete(id)

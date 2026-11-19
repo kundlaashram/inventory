@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, Suspense } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import Image from 'next/image'
@@ -18,14 +18,20 @@ import { toast } from 'sonner'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { AmountDisplay } from '@/components/ui/AmountDisplay'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { Pagination } from '@/components/ui/Pagination'
 import type { BuyingEntryRow } from '@/components/products/BuyingEntryTable'
 import { cn } from '@/lib/utils'
+import { useUrlParams, useSyncUrlParams, useListHref } from '@/hooks/useUrlFilters'
+
+const SELLING_HISTORY_PAGE_SIZE = 20
 
 interface SellingHistoryRow {
   _id: string
   sellBillId: string
   billNumber: number
   billDate: string
+  isCashbook?: boolean
+  isBankSale?: boolean
   companyId?: string
   companyName: string
   ctnSold: number
@@ -45,9 +51,12 @@ interface ProductDetail {
   productName: string
   productDescription?: string
   productImage?: string
+  ctnWeightKg?: number | null
+  ctnCbm?: number | null
   buyingEntriesCount: number
   totalCtn: number
   availableCtn: number
+  availablePcs: number
   totalSoldCtn: number
   chinaWhCtn: number
   inTransitCtn: number
@@ -83,9 +92,10 @@ function StatCard({
   )
 }
 
-export default function ProductDetailPage() {
+function ProductDetailPageContent() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/products')
   const id = params?.id as string
   const [product, setProduct] = useState<ProductDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -93,6 +103,9 @@ export default function ProductDetailPage() {
   const [entrySheetOpen, setEntrySheetOpen] = useState(false)
   const [paymentDialogOpen, setPaymentDialogOpen] = useState(false)
   const [editingEntry, setEditingEntry] = useState<BuyingEntryRow | null>(null)
+  const url = useUrlParams()
+  const [sellingPage, setSellingPage] = useState(() => url.int('sellingPage', 1))
+  useSyncUrlParams({ sellingPage: sellingPage > 1 ? sellingPage : undefined })
 
   const fetchProduct = useCallback(async () => {
     if (!id) return
@@ -127,7 +140,7 @@ export default function ProductDetailPage() {
       return
     }
     toast.success('Product deleted')
-    router.push('/products')
+    router.push(listHref)
   }
 
   function openAddEntry() {
@@ -148,13 +161,21 @@ export default function ProductDetailPage() {
     )
   }
 
+  const sellingHistory = product.sellingHistory ?? []
+  const sellingTotalPages = Math.max(1, Math.ceil(sellingHistory.length / SELLING_HISTORY_PAGE_SIZE))
+  const currentSellingPage = Math.min(sellingPage, sellingTotalPages)
+  const pagedSellingHistory = sellingHistory.slice(
+    (currentSellingPage - 1) * SELLING_HISTORY_PAGE_SIZE,
+    currentSellingPage * SELLING_HISTORY_PAGE_SIZE
+  )
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={product.productName}
         description={product.productDescription ?? undefined}
         breadcrumb={
-          <a href="/products" className="text-muted-foreground hover:text-foreground">
+          <a href={listHref} className="text-muted-foreground hover:text-foreground">
             Products
           </a>
         }
@@ -200,6 +221,11 @@ export default function ProductDetailPage() {
           color={product.availableCtn > 0 ? 'text-green-600' : 'text-muted-foreground'}
         />
         <StatCard
+          label="Available Pcs"
+          value={product.availablePcs}
+          color={product.availablePcs > 0 ? 'text-green-600' : 'text-muted-foreground'}
+        />
+        <StatCard
           label="Total Sold CTN"
           value={product.totalSoldCtn}
           color={product.totalSoldCtn > 0 ? 'text-red-600 dark:text-red-400' : 'text-muted-foreground'}
@@ -238,11 +264,12 @@ export default function ProductDetailPage() {
           </div>
         </TabsContent>
         <TabsContent value="selling" className="mt-4">
-          {!product.sellingHistory?.length ? (
+          {!sellingHistory.length ? (
             <div className="rounded-md border py-12 text-center text-muted-foreground">
               No sales yet for this product.
             </div>
           ) : (
+            <div className="space-y-4">
             <div className="w-full overflow-hidden rounded-md border">
               <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -262,7 +289,7 @@ export default function ProductDetailPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {product.sellingHistory.map((row) => (
+                  {pagedSellingHistory.map((row) => (
                     <tr key={row._id} className="border-b last:border-0">
                       <td className="p-3">
                         <Link href={`/sale-bills/${row.sellBillId}`} className="text-primary hover:underline font-medium">
@@ -271,7 +298,16 @@ export default function ProductDetailPage() {
                       </td>
                       <td className="p-3">{format(new Date(row.billDate), 'dd MMM yyyy')}</td>
                       <td className="p-3">
-                        {row.companyId ? (
+                        {row.isCashbook ? (
+                          <span className="inline-flex items-center gap-1 text-green-700 dark:text-green-400 text-xs font-semibold">
+                            💵 CASHBOOK
+                          </span>
+                        ) : row.isBankSale ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            {row.companyName}
+                            <span className="text-blue-700 dark:text-blue-400 text-[10px] font-semibold tracking-wide">🏦 BANK</span>
+                          </span>
+                        ) : row.companyId ? (
                           <Link href={`/companies/${row.companyId}`} className="text-primary hover:underline">
                             {row.companyName}
                           </Link>
@@ -324,6 +360,14 @@ export default function ProductDetailPage() {
               </table>
               </div>
             </div>
+            <Pagination
+              page={currentSellingPage}
+              totalPages={sellingTotalPages}
+              total={sellingHistory.length}
+              pageSize={SELLING_HISTORY_PAGE_SIZE}
+              onPageChange={setSellingPage}
+            />
+            </div>
           )}
         </TabsContent>
       </Tabs>
@@ -336,6 +380,8 @@ export default function ProductDetailPage() {
           productName: product.productName,
           productDescription: product.productDescription ?? '',
           productImage: product.productImage ?? '',
+          ctnWeightKg: product.ctnWeightKg,
+          ctnCbm: product.ctnCbm,
         }}
         title="Edit Product"
         submitLabel="Update"
@@ -356,5 +402,13 @@ export default function ProductDetailPage() {
         editEntry={editingEntry ?? null}
       />
     </div>
+  )
+}
+
+export default function ProductDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <ProductDetailPageContent />
+    </Suspense>
   )
 }

@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import Link from 'next/link'
 import { format } from 'date-fns'
-import { Plus, Pencil, Trash2 } from 'lucide-react'
+import { Plus, Pencil, Trash2, Sparkles } from 'lucide-react'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -21,6 +21,7 @@ import { Pagination } from '@/components/ui/Pagination'
 import { cn } from '@/lib/utils'
 import { Receipt } from 'lucide-react'
 import type { DateRange } from 'react-day-picker'
+import { useUrlParams, useSyncUrlParams, dateRangeParams } from '@/hooks/useUrlFilters'
 
 interface PaymentRow {
   _id: string
@@ -41,13 +42,16 @@ interface PaymentsData {
   summary: { today: number; thisMonth: number }
 }
 
-export default function ReceivedVoucherPage() {
+function ReceivedVoucherPageContent() {
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<PaymentsData | null>(null)
-  const [companyFilter, setCompanyFilter] = useState('')
-  const [modeFilter, setModeFilter] = useState<'all' | 'cash' | 'online' | 'set_off'>('all')
-  const [dateRange, setDateRange] = useState<DateRange | undefined>()
-  const [page, setPage] = useState(1)
+  const url = useUrlParams()
+  const [companyFilter, setCompanyFilter] = useState(() => url.str('company'))
+  const [modeFilter, setModeFilter] = useState<'all' | 'cash' | 'online' | 'set_off'>(() =>
+    url.oneOf('mode', ['all', 'cash', 'online', 'set_off'], 'all')
+  )
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(() => url.dateRange())
+  const [page, setPage] = useState(() => url.int('page', 1))
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingPayment, setEditingPayment] = useState<PaymentFormValues | null>(null)
   const [companyOptions, setCompanyOptions] = useState<SearchableSelectOption<string>[]>([])
@@ -68,13 +72,20 @@ export default function ReceivedVoucherPage() {
   }, [page, companyFilter, modeFilter, dateRange?.from, dateRange?.to])
 
   const fetchCompanies = useCallback(async () => {
-    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?limit=500')
+    const res = await apiGet<{ companies: { _id: string; companyName: string }[] }>('/api/companies?basic=true')
     if (res.success) setCompanyOptions(res.data.companies.map((c) => ({ value: c._id, label: c.companyName })))
   }, [])
 
   useEffect(() => {
     fetchPayments()
   }, [fetchPayments])
+
+  useSyncUrlParams({
+    company: companyFilter,
+    mode: modeFilter !== 'all' ? modeFilter : undefined,
+    ...dateRangeParams(dateRange),
+    page: page > 1 ? page : undefined,
+  })
 
   useEffect(() => {
     fetchCompanies()
@@ -116,10 +127,18 @@ export default function ReceivedVoucherPage() {
         title="Receive Voucher"
         description="Record and manage received vouchers from companies."
         action={
-          <Button onClick={openAdd}>
-            <Plus className="mr-2 h-4 w-4" />
-            Add Voucher
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" asChild>
+              <Link href="/received-voucher/quick">
+                <Sparkles className="mr-2 h-4 w-4" />
+                Quick Voucher from Message
+              </Link>
+            </Button>
+            <Button onClick={openAdd}>
+              <Plus className="mr-2 h-4 w-4" />
+              Add Voucher
+            </Button>
+          </div>
         }
       />
 
@@ -278,5 +297,13 @@ export default function ReceivedVoucherPage() {
         editPayment={editingPayment}
       />
     </div>
+  )
+}
+
+export default function ReceivedVoucherPage() {
+  return (
+    <Suspense fallback={null}>
+      <ReceivedVoucherPageContent />
+    </Suspense>
   )
 }

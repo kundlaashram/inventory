@@ -16,6 +16,7 @@ import { authHeaders } from '@/lib/api-client'
 import { toast } from 'sonner'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { cn, generateBillFileName } from '@/lib/utils'
+import { useListHref } from '@/hooks/useUrlFilters'
 
 interface FifoItem {
   buyingEntry: { _id: string; entryDate?: string }
@@ -63,12 +64,15 @@ interface BillDetail {
     city?: string
   } | null
   isCashbook?: boolean
+  isBankSale?: boolean
+  bankAccount?: { _id: string; accountName: string } | null
   items: BillItem[]
 }
 
 export default function SellBillDetailPage() {
   const params = useParams()
   const router = useRouter()
+  const listHref = useListHref('/sale-bills')
   const id = params?.id as string
   const [bill, setBill] = useState<BillDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -108,7 +112,7 @@ export default function SellBillDetailPage() {
     const a = document.createElement('a')
     a.href = url
     a.download = generateBillFileName({
-      companyName: bill.isCashbook ? 'Cashbook' : (bill.company?.companyName ?? '—'),
+      companyName: bill.isCashbook ? 'Cashbook' : bill.isBankSale ? (bill.bankAccount?.accountName ?? 'BankAccount') : (bill.company?.companyName ?? '—'),
       billNumber: bill.billNumber,
       billDate: bill.billDate,
     })
@@ -140,7 +144,7 @@ export default function SellBillDetailPage() {
     const result = await apiDelete(`/api/sell-bills/${id}`)
     if (result.success) {
       toast.success('Bill deleted')
-      router.push('/sale-bills')
+      router.push(listHref)
     } else toast.error(result.message)
   }
 
@@ -177,7 +181,7 @@ export default function SellBillDetailPage() {
         description={format(new Date(bill.billDate), 'PPP')}
         breadcrumb={
           <>
-            <Link href="/sale-bills" className="text-muted-foreground hover:text-foreground">
+            <Link href={listHref} className="text-muted-foreground hover:text-foreground">
               Sale Bills
             </Link>
             <span className="text-muted-foreground"> / Bill #{bill.billNumber}</span>
@@ -199,11 +203,11 @@ export default function SellBillDetailPage() {
               variant="outline"
               size="sm"
               onClick={handleSendWhatsApp}
-              disabled={bill.isCashbook || bill.whatsappSent || sendingWhatsApp}
-              title={bill.isCashbook ? 'Not available for Cashbook bills' : undefined}
+              disabled={bill.isCashbook || bill.isBankSale || bill.whatsappSent || sendingWhatsApp}
+              title={bill.isCashbook ? 'Not available for Cashbook bills' : bill.isBankSale ? 'Not available for Bank Account bills' : undefined}
             >
               <MessageCircle className="mr-2 h-4 w-4" />
-              {bill.isCashbook ? 'WhatsApp N/A' : bill.whatsappSent ? 'Sent' : sendingWhatsApp ? 'Sending...' : 'Send WhatsApp'}
+              {(bill.isCashbook || bill.isBankSale) ? 'WhatsApp N/A' : bill.whatsappSent ? 'Sent' : sendingWhatsApp ? 'Sending...' : 'Send WhatsApp'}
             </Button>
             <ConfirmDialog
               title="Delete sale bill"
@@ -227,8 +231,12 @@ export default function SellBillDetailPage() {
           <div className="grid gap-2 sm:grid-cols-2">
             <div>
               <p className="text-sm text-muted-foreground">To</p>
-              {bill.isCashbook || !bill.company ? (
+              {bill.isCashbook ? (
                 <span className="font-medium text-green-700 dark:text-green-400">💵 Cashbook</span>
+              ) : bill.isBankSale ? (
+                <span className="font-medium text-blue-700 dark:text-blue-400">🏦 {bill.bankAccount?.accountName ?? 'Bank Account'}</span>
+              ) : !bill.company ? (
+                <span className="font-medium text-muted-foreground">—</span>
               ) : (
                 <>
                   <Link href={`/companies/${bill.company._id}`} className="font-medium hover:underline">
@@ -245,10 +253,13 @@ export default function SellBillDetailPage() {
               )}
             </div>
             <div className="text-right space-y-1 text-sm">
-              <div className="flex justify-between gap-4 text-muted-foreground">
-                <span>Subtotal</span>
-                <span>₹{bill.totalAmount.toLocaleString('en-IN')}</span>
-              </div>
+              {((bill.extraCharges != null && bill.extraCharges > 0) ||
+                (bill.discount != null && bill.discount > 0)) && (
+                <div className="flex justify-between gap-4 text-muted-foreground">
+                  <span>Subtotal</span>
+                  <span>₹{bill.totalAmount.toLocaleString('en-IN')}</span>
+                </div>
+              )}
               {bill.extraCharges != null && bill.extraCharges > 0 && (
                 <div className="flex justify-between gap-4 text-orange-600 dark:text-orange-400">
                   <span>Extra Charges {bill.extraChargesNote && `(${bill.extraChargesNote})`}</span>
